@@ -1,0 +1,5479 @@
+module NilNumber
+
+using NNlib
+import Random
+
+"""
+    nil = Nil()
+
+`Nil` is a singleton type with a single instance `nil`.
+Unlike `Nothing` and `Missing` it is a number: `Nil <: Real <: Number`.
+"""
+struct Nil <: Real end
+
+@doc @doc(Nil)
+const nil = Nil()
+
+Nil(::T) where T<:Number = nil
+(::Type{T})(::Nil) where T<:Number = nil
+Base.convert(::Type{Nil}, ::Number) = nil
+Base.convert(::Type{T}, ::Nil) where {T<:Number} = zero(T)
+Base.convert(::Type{Nil}, ::Nil) = nil
+
+Base.float(::Type{Nil}) = Nil
+
+for f in [:copy, :zero, :one, :oneunit,
+          :+, :-, :abs, :abs2, :inv,
+          :exp, :log, :log1p, :log2, :log10,
+          :sqrt, :tanh, :conj]
+  @eval Base.$f(::Nil) = nil
+end
+
+for f in [:+, :-, :*, :/, :^, :mod, :div, :rem]
+  @eval Base.$f(::Nil, ::Nil) = nil
+end
+
+Base.:<(::Nil, ::Nil) = true
+Base.:<=(::Nil, ::Nil) = true
+
+Base.isnan(::Nil) = false
+Base.isfinite(::Nil) = true
+Base.typemin(::Type{Nil}) = nil
+Base.typemax(::Type{Nil}) = nil
+
+Base.promote_rule(x::Type{Nil}, y::Type{<:Number}) = Nil
+
+Random.rand(rng::Random.AbstractRNG, ::Random.SamplerType{Nil}) = nil
+
+end  # module
+
+using .NilNumber: Nil, nil
+
+"""
+    outputsize(m, inputsize::Tuple; padbatch=false)
+
+Calculate the size of the output from model `m`, given the size of the input.
+Obeys `outputsize(m, size(x)) == size(m(x))` for valid input `x`.
+
+Keyword `padbatch=true` is equivalent to using `(inputsize..., 1)`, and
+returns the final size including this extra batch dimension.
+
+This should be faster than calling `size(m(x))`. It uses a trivial number type,
+which should work out of the box for custom layers.
+
+If `m` is a `Tuple` or `Vector`, its elements are applied in sequence, like `Chain(m...)`.
+
+# Examples
+```jldoctest
+julia> using Flux: outputsize
+
+julia> outputsize(Dense(10 => 4), (10,); padbatch=true)
+(4, 1)
+
+julia> m = Chain(Conv((3, 3), 3 => 16), Conv((3, 3), 16 => 32));
+
+julia> m(randn(Float32, 10, 10, 3, 64)) |> size
+(6, 6, 32, 64)
+
+julia> outputsize(m, (10, 10, 3); padbatch=true)
+(6, 6, 32, 1)
+
+julia> outputsize(m, (10, 10, 3, 64))
+(6, 6, 32, 64)
+
+julia> try outputsize(m, (10, 10, 7, 64)) catch e println(e) end
+DimensionMismatch("layer Conv((3, 3), 3 => 16) expects size(input, 3) == 3, but got 10×10×7×64 Array{Flux.NilNumber.Nil, 4}")
+
+julia> outputsize([Dense(10 => 4), Dense(4 => 2)], (10, 1)) # Vector of layers becomes a Chain
+(2, 1)
+```
+"""
+function outputsize(m, inputsizes::Tuple...; padbatch=false)
+  x = nil_input(padbatch, inputsizes...)
+  return size(m(x))
+end
+
+nil_input(pad::Bool, s::Tuple{Vararg{Integer}}) = pad ? fill(nil, (s...,1)) : fill(nil, s)
+nil_input(pad::Bool, multi::Tuple{Vararg{Integer}}...) = nil_input.(pad, multi)
+nil_input(pad::Bool, tup::Tuple{Vararg{Tuple}}) = nil_input(pad, tup...)
+
+
+"""
+    outputsize(m, x_size, y_size, ...; padbatch=false)
+
+For model or layer `m` accepting multiple arrays as input,
+this returns `size(m((x, y, ...)))` given `size_x = size(x)`, etc.
+
+# Examples
+```jldoctest
+julia> x, y = rand(Float32, 5, 64), rand(Float32, 7, 64);
+
+julia> par = Parallel(vcat, Dense(5 => 9), Dense(7 => 11));
+
+julia> Flux.outputsize(par, (5, 64), (7, 64))
+(20, 64)
+
+julia> m = Chain(par, Dense(20 => 13), softmax);
+
+julia> Flux.outputsize(m, (5,), (7,); padbatch=true)
+(13, 1)
+
+julia> par(x, y) == par((x, y)) == Chain(par, identity)((x, y))
+true
+```
+Notice that `Chain` only accepts multiple arrays as a tuple,
+while `Parallel` also accepts them as multiple arguments;
+`outputsize` always supplies the tuple.
+"""
+outputsize
+
+## make tuples and vectors be like Chains
+
+outputsize(m::Tuple, input::Tuple...; padbatch=false) = outputsize(Chain(m...), input...; padbatch=padbatch)
+outputsize(m::AbstractVector, input::Tuple...; padbatch=false) = outputsize(Chain(m...), input...; padbatch=padbatch)
+
+## bypass statistics in normalization layers
+
+for layer in (:BatchNorm, :InstanceNorm, :GroupNorm)  # LayerNorm works fine
+  @eval function (l::$layer)(x::AbstractArray{Nil,N}) where N
+    _size_check(l, x, N-1 => l.chs)
+    x
+  end
+end
+
+## fixes for layers that don't work out of the box
+
+for (fn, Dims) in ((:conv, DenseConvDims),)
+  @eval begin
+    function NNlib.$fn(a::AbstractArray{Nil}, b::AbstractArray{Nil}, dims::$Dims)
+      fill(nil, NNlib.output_size(dims)..., NNlib.channels_out(dims), size(a)[end])
+    end
+
+    function NNlib.$fn(a::AbstractArray{<:Real}, b::AbstractArray{Nil}, dims::$Dims)
+      NNlib.$fn(fill(nil, size(a)), b, dims)
+    end
+
+    function NNlib.$fn(a::AbstractArray{Nil}, b::AbstractArray{<:Real}, dims::$Dims)
+      NNlib.$fn(a, fill(nil, size(b)), dims)
+    end
+  end
+end
+
+"""
+    @autosize (size...,) Chain(Layer(_ => 2), Layer(_), ...)
+
+Returns the specified model, with each `_` replaced by an inferred number,
+for input of the given `size`.
+
+The unknown sizes are usually the second-last dimension of that layer's input,
+which Flux regards as the channel dimension.
+(A few layers, `Dense` & [`LayerNorm`](@ref), instead always use the first dimension.)
+The underscore may appear as an argument of a layer, or inside a `=>`.
+It may be used in further calculations, such as `Dense(_ => _÷4)`.
+
+# Examples
+```
+julia> @autosize (3, 1) Chain(Dense(_ => 2, sigmoid), BatchNorm(_, affine=false))
+Chain(
+  Dense(3 => 2, σ),                     # 8 parameters
+  BatchNorm(2, affine=false),
+)
+
+julia> img = [28, 28];
+
+julia> @autosize (img..., 1, 32) Chain(              # size is only needed at runtime
+          Chain(c = Conv((3,3), _ => 5; stride=2, pad=SamePad()),
+                p = MeanPool((3,3)),
+                b = BatchNorm(_),
+                f = Flux.flatten),
+          Dense(_ => _÷4, relu, init=Flux.rand32),   # can calculate output size _÷4
+          SkipConnection(Dense(_ => _, relu), +),
+          Dense(_ => 10),
+       )
+Chain(
+  Chain(
+    c = Conv((3, 3), 1 => 5, pad=1, stride=2),  # 50 parameters
+    p = MeanPool((3, 3)),
+    b = BatchNorm(5),                   # 10 parameters, plus 10
+    f = Flux.flatten,
+  ),
+  Dense(80 => 20, relu),                # 1_620 parameters
+  SkipConnection(
+    Dense(20 => 20, relu),              # 420 parameters
+    +,
+  ),
+  Dense(20 => 10),                      # 210 parameters
+)         # Total: 10 trainable arrays, 2_310 parameters,
+          # plus 2 non-trainable, 10 parameters, summarysize 10.469 KiB.
+
+julia> outputsize(ans, (28, 28, 1, 32))
+(10, 32)
+```
+
+Limitations:
+* While `@autosize (5, 32) Flux.Bilinear(_ => 7)` is OK, something like `Bilinear((_, _) => 7)` will fail.
+* While `Scale(_)` and `LayerNorm(_)` are fine (and use the first dimension), `Scale(_,_)` and `LayerNorm(_,_)`
+  will fail if `size(x,1) != size(x,2)`.
+"""
+macro autosize(size, model)
+  Meta.isexpr(size, :tuple) || error("@autosize's first argument must be a tuple, the size of the input")
+  Meta.isexpr(model, :call) || error("@autosize's second argument must be something like Chain(layers...)")
+  ex = _makelazy(model)
+  @gensym m
+  quote
+    $m = $ex
+    $outputsize($m, $size)
+    $striplazy($m)
+  end |> esc
+end
+
+function _makelazy(ex::Expr)
+  n = _underscoredepth(ex)
+  n == 0 && return ex
+  n == 1 && error("@autosize doesn't expect an underscore here: ", ex)
+  n == 2 && return :($LazyLayer($(string(ex)), $(_makefun(ex)), nothing))
+  n > 2 && return Expr(ex.head, map(_makelazy, ex.args)...)
+end
+_makelazy(x) = x
+
+function _underscoredepth(ex::Expr)
+  # Meta.isexpr(ex, :tuple) && :_ in ex.args && return 10
+  ex.head in (:call, :kw, :(->), :block, :parameters)  || return 0
+  ex.args[1] === :(=>) && ex.args[2] === :_ && return 1
+  m = maximum(_underscoredepth, ex.args)
+  m == 0 ? 0 : m+1
+end
+_underscoredepth(ex) = Int(ex === :_)
+
+function _makefun(ex)
+  T = Meta.isexpr(ex, :call) ? ex.args[1] : Type
+  @gensym x s
+  Expr(:(->), x, Expr(:block, :($s = $autosizefor($T, $x)), _replaceunderscore(ex, s)))
+end
+
+"""
+    autosizefor(::Type, x)
+
+If an `_` in your layer's constructor, used within `@autosize`, should
+*not* mean the 2nd-last dimension, then you can overload this.
+
+For instance `autosizefor(::Type{<:Dense}, x::AbstractArray) = size(x, 1)`
+is needed to make `@autosize (2,3,4) Dense(_ => 5)` return
+`Dense(2 => 5)` rather than `Dense(3 => 5)`.
+"""
+autosizefor(::Type, x::AbstractArray) = size(x, max(1, ndims(x)-1))
+autosizefor(::Type{<:Dense}, x::AbstractArray) = size(x, 1)
+autosizefor(::Type{<:Embedding}, x::AbstractArray) = size(x, 1)
+autosizefor(::Type{<:LayerNorm}, x::AbstractArray) = size(x, 1)
+
+_replaceunderscore(e, s) = e === :_ ? s : e
+_replaceunderscore(ex::Expr, s) = Expr(ex.head, map(a -> _replaceunderscore(a, s), ex.args)...)
+
+mutable struct LazyLayer
+  str::String
+  make::Function
+  layer
+end
+
+function (l::LazyLayer)(x::AbstractArray, ys::AbstractArray...)
+  l.layer === nothing || return l.layer(x, ys...)
+  made = l.make(x)  # for something like `Bilinear((_,__) => 7)`, perhaps need `make(xy...)`, later.
+  y = made(x, ys...)
+  l.layer = made  # mutate after we know that call worked
+  return y
+end
+
+function striplazy(m)
+  fs, re = Functors.functor(m)
+  re(map(striplazy, fs))
+end
+function striplazy(l::LazyLayer)
+  l.layer === nothing || return l.layer
+  error("LazyLayer should be initialised, e.g. by outputsize(model, size), before using stiplazy")
+end
+
+# Could make LazyLayer usable outside of @autosize, for instance allow Chain(@lazy Dense(_ => 2))?
+# But then it will survive to produce weird structural gradients etc.
+
+function ChainRulesCore.rrule(l::LazyLayer, x)
+  l(x), _ -> error("LazyLayer should never be used within a gradient. Call striplazy(model) first to remove all.")
+end
+function ChainRulesCore.rrule(::typeof(striplazy), m)
+  striplazy(m), _ -> error("striplazy should never be used within a gradient")
+end
+
+Functors.functor(::Type{<:LazyLayer}, x) = error("LazyLayer should not be walked with Functors.jl, as the arrays which Flux.gpu wants to move may not exist yet.")
+
+function Base.show(io::IO, l::LazyLayer)
+  printstyled(io, "LazyLayer(", color=:light_black)
+  if l.layer == nothing
+    printstyled(io, l.str, color=:magenta)
+  else
+    printstyled(io, l.layer, color=:cyan)
+  end
+  printstyled(io, ")", color=:light_black)
+end
+
+_big_show(io::IO, l::LazyLayer, indent::Int=0, name=nothing) = _layer_show(io, l, indent, name)
+
+
+
+
+loadleaf!(dst, src) = dst
+loadleaf!(dst::AbstractArray, src) =
+  error("Tried to copy $src into an array destination; this is not allowed.")
+loadleaf!(dst, src::AbstractArray) =
+  error("Tried to copy an array to $dst; this is not allowed.")
+
+function loadleaf!(dst::AbstractArray, src::Bool)
+  if iszero(src)
+    dst .= src
+  else
+    error("Cannot copy boolean parameter == true to non-zero parameter.")
+  end
+  return dst
+end
+
+loadleaf!(dst::Bool, src::AbstractArray) = iszero(dst) ? dst :
+  error("Cannot copy non-zero parameter to boolean parameter == true.")
+
+function loadleaf!(dst::AbstractArray, src::AbstractArray)
+  err = DimensionMismatch("Tried to load size $(size(src)) array into size $(size(dst))")
+  (size(dst) == size(src)) || throw(err)
+  copyto!(dst, src)
+end
+
+_tie_check(dst::Bool, src::AbstractArray) = iszero(dst) ||
+  error("Encountered tied parameter with boolean source at some nodes and non-boolean sources at others.")
+_tie_check(dst::AbstractArray, src::Bool) = (iszero(dst) && iszero(src)) ||
+  error("Encountered tied parameter with boolean source at some nodes and non-boolean sources at others.")
+_tie_check(dst::AbstractArray, src::AbstractArray) = (dst == src) ||
+  error("Encountered tied destination parameters with untied and mismatched sources.")
+_tie_check(dst, src) = true
+
+_bool_tie_check(dst, src) = true
+
+_filter_children(f, children::NamedTuple) =
+  NamedTuple(filter(kv -> f(kv[2]), pairs(children)))
+_filter_children(f, children) = filter(f, children)
+
+"""
+    loadmodel!(dst, src)
+
+Copy all the parameters (trainable and non-trainable) from `src` into `dst`.
+
+Recursively walks `dst` and `src` together using [`Functors.children`](@ref),
+and calling `copyto!` on parameter arrays or throwing an error when there is a mismatch.
+Non-array elements (such as activation functions) are not copied and need not match.
+Zero bias vectors and `bias=false` are considered equivalent
+(see extended help for more details).
+
+See also [`Flux.state`](@ref).
+
+# Examples
+```julia-repl
+julia> dst = Chain(Dense(Flux.ones32(2, 5), Flux.ones32(2), tanh), Dense(2 => 1; bias = [1f0]))
+Chain(
+  Dense(5 => 2, tanh),                  # 12 parameters
+  Dense(2 => 1),                        # 3 parameters
+)                   # Total: 4 arrays, 15 parameters, 316 bytes.
+
+julia> dst[1].weight ≈ ones(2, 5)  # by construction
+true
+
+julia> src = Chain(Dense(5 => 2, relu), Dense(2 => 1, bias=false));
+
+julia> Flux.loadmodel!(dst, src);
+
+julia> dst[1].weight ≈ ones(2, 5)  # values changed
+false
+
+julia> iszero(dst[2].bias)
+true
+```
+
+# Extended help
+
+Throws an error when:
+- `dst` and `src` do not share the same fields (at any level)
+- the sizes of leaf nodes are mismatched between `dst` and `src`
+- copying non-array values to/from an array parameter
+  (except inactive parameters described below)
+- `dst` is a "tied" parameter (i.e. refers to another parameter) and
+  loaded into multiple times with mismatched source values
+
+Inactive parameters can be encoded by using the boolean value `false` instead of an array.
+If `dst == false` and `src` is an all-zero array, no error will be raised (and no values copied);
+however, attempting to copy a non-zero array to an inactive parameter will throw an error.
+Likewise, copying a `src` value of `false` to any `dst` array is valid,
+but copying a `src` value of `true` will error.
+"""
+function loadmodel!(dst, src; filter = _ -> true, cache = Base.IdSet())
+  ldsts = _filter_children(filter, Functors.children(dst))
+  lsrcs = _filter_children(filter, Functors.children(src))
+  keys_ldsts = keys(ldsts)
+  keys_lsrcs = keys(lsrcs)
+  collect(keys_ldsts) == collect(keys_lsrcs) || throw(ArgumentError("Tried to load $(keys_lsrcs) into $(keys_ldsts) but the structures do not match."))
+
+  for k in keys_lsrcs
+    lsrc, ldst = lsrcs[k], ldsts[k]
+    if ldst in cache # we already loaded this parameter before
+      _tie_check(ldst, lsrc)
+    elseif Functors.isleaf(ldst) # our first time loading this leaf
+      push!(cache, ldst)
+      loadleaf!(ldst, lsrc)
+    else # this isn't a leaf
+      loadmodel!(ldst, lsrc; filter, cache)
+    end
+  end
+
+  return dst
+end
+
+"""
+    state(x)
+
+Return an object with the same nested structure as `x` according to `Functors.children`,
+but made only of basic containers (e.g. named tuples, tuples, arrays, and dictionaries).
+
+Besides trainable and non-trainable arrays, the state will contain leaf nodes that are not arrays,
+such as numbers, symbols, strings, and nothing values. The leaf types that end up in the state
+could increase in the future.
+
+This method is particularly useful for saving and loading models,
+since the state contain only simple data types that can be easily serialized.
+
+The state can be passed to [`loadmodel!`](@ref) to restore the model.
+
+# Examples
+
+## Copy the state into another model
+
+```jldoctest
+julia> m1 = Chain(Dense(1, 2, tanh; init=ones), Dense(2, 1; init=ones));
+
+julia> s = Flux.state(m1)
+(layers = ((weight = [1.0; 1.0;;], bias = [0.0, 0.0], σ = ()), (weight = [1.0 1.0], bias = [0.0], σ = ())),)
+
+julia> m2 = Chain(Dense(1, 2, tanh), Dense(2, 1; bias=false));  # weights are random numbers
+
+julia> Flux.loadmodel!(m2, s);
+
+julia> m2[1].weight   # now the weights of m2 are the same as m1
+2×1 Matrix{Float32}:
+ 1.0
+ 1.0
+
+julia> Flux.state(trainmode!(Dropout(0.2)))  # contains p & activity, but not RNG state
+(p = 0.2, dims = (), active = true, rng = ())
+
+julia> Flux.state(BatchNorm(1))  # contains non-trainable arrays μ, σ²
+(λ = (), β = Float32[0.0], γ = Float32[1.0], μ = Float32[0.0], σ² = Float32[1.0], ϵ = 1.0f-5, momentum = 0.1f0, affine = true, track_stats = true, active = nothing, chs = 1)
+```
+
+## Save and load with BSON
+
+```julia-repl
+julia> using BSON
+
+julia> BSON.@save "checkpoint.bson" model_state = s
+
+julia> Flux.loadmodel!(m2, BSON.load("checkpoint.bson")[:model_state])
+```
+
+## Save and load with JLD2
+
+```julia-repl
+julia> using JLD2
+
+julia> JLD2.jldsave("checkpoint.jld2", model_state = s)
+
+julia> Flux.loadmodel!(m2, JLD2.load("checkpoint.jld2", "model_state"))
+```
+"""
+state(x) = Functors.fmapstructure(_state, x)
+
+const STATE_TYPES = Union{AbstractArray, Number, Nothing, AbstractString, Symbol}
+
+_state(x::STATE_TYPES) = x
+_state(x) = ()
+
+#=
+Starting with `gradient(f, m) == gradient(f, Duplicated(m))`,
+we choose to regard `Duplicated` as some kind of label, not part of the model tree,
+and avoid outer NamedTuples like `(; val=..., dval=...)`.
+We certainly don't want to save model gradients alongside parameters/settings:
+=#
+state(x::EnzymeCore.Duplicated) = state(x.val)
+
+loadmodel!(dst::EnzymeCore.Duplicated, src::EnzymeCore.Duplicated; kw...) = @invoke loadmodel!(dst::Any, src::Any; kw...)
+loadmodel!(dst::EnzymeCore.Duplicated, src; kw...) = (loadmodel!(dst.val, src; kw...); dst)
+
+
+"""
+    gradient(f, args...)
+
+Returns a tuple containing `∂f/∂x` for each argument `x`,
+the derivative (for scalar `x`) or the gradient.
+If no gradient is defined, `∂f/∂x` will be `nothing`.
+
+`f(args...)` must be a real number, see [`Zygote.jacobian`](@ref) for array output.
+
+By default, `Flux.gradient` calls Zygote. If you load Enzyme, then other methods become available.
+
+See also [`withgradient`](@ref) to keep the value `f(args...)`.
+
+# Examples
+
+```
+julia> Flux.gradient(*, 2.0, 3.0, 5.0)
+(15.0, 10.0, 6.0)
+
+julia> Flux.gradient(x -> sum(abs2,x), [7.0, 11.0, 13.0])
+([14.0, 22.0, 26.0],)
+
+julia> Flux.gradient([7, 11], 0, 1) do x, y, d
+         p = size(x, d)
+         sum(x.^p .+ y)
+       end
+([14.0, 22.0], 2.0, nothing)
+```
+"""
+function gradient(f, args...; zero::Bool=true)
+    for a in args
+        a isa EnzymeCore.Duplicated && return _enzyme_gradient(f, map(_ensure_enzyme, args)...; zero)
+    end
+    for a in args
+        _ensure_noenzyme(a)
+    end
+    if Zygote.isderiving()
+        error("""`Flux.gradient` does not support use within a Zygote gradient.
+            If what you are doing worked on Flux < 0.14, then calling `Zygote.gradient` directly should still work.
+            If you are writing new code, then Zygote over Zygote is heavily discouraged.
+            """)
+    end
+    Zygote.gradient(f, args...)
+end
+
+# Given one Duplicated, we wrap everything else in Const before calling Enzyme
+_ensure_enzyme(x::EnzymeCore.Duplicated) = x
+_ensure_enzyme(x::EnzymeCore.Const) = x
+_ensure_enzyme(x) = EnzymeCore.Const(x)
+_ensure_enzyme(x::EnzymeCore.Active) = throw(ArgumentError(
+    "The method `gradient(f, xs...)` using Enzyme.jl does not support `Active`, only `Duplicated` and ``Const`."
+))
+
+# Without any Duplicated, check for no stray Enzyme types before calling Zygote
+_ensure_noenzyme(::EnzymeCore.Const) = throw(ArgumentError(
+    "The method `gradient(f, xs...)` using Enzyme.jl requires at least one `Duplicated` argument, not just `Const`."
+))
+_ensure_noenzyme(::EnzymeCore.Active) = throw(ArgumentError(
+    "The method `gradient(f, xs...)` using Enzyme.jl does not support `Active`, only `Duplicated` and ``Const`"
+))
+_ensure_noenzyme(_) = nothing
+
+"""
+    gradient(f, args::Union{Const,Duplicated}...)
+
+This should return the same answer as `gradient(f, args...)`,
+but it uses Enzyme.jl instead of Zygote.jl to compute the derivative.
+
+Only available when Enzyme is loaded!
+
+This method is used when at least one argument is of type `Duplicated`,
+and all unspecified aguments are wrapped in `Const`.
+Note that Enzyme's `Active` is not supported.
+
+Besides returning the gradient, this is also stored within the `Duplicated` object.
+Calling `Enzyme.Duplicated(model)` allocates space for the gradient,
+which is zero'd befor use when calling `gradient`.
+With the keyword `zero=false`, the new gradient will instead be added to what is already stored.
+
+!!! warning "Experimental"
+    Enzyme support like this is new and somewhat experimental.
+    This method was added in Flux 0.15.
+
+# Example
+```
+julia> using Flux
+
+julia> model = Chain(Dense([3.0;;]));
+
+julia> Flux.gradient(model, [1]) do m, x  # computed using Zygote
+         sum(abs2, m(x))
+       end
+((layers = ((weight = [6.0;;], bias = [6.0], σ = nothing),),), [18.0])
+
+julia> using Enzyme
+
+julia> dup_model = Duplicated(model);  # allocates space for gradient
+
+julia> Flux.gradient(dup_model, Const([1])) do m, x  # Enzyme, returns the same
+         sum(abs2, m(x))
+       end
+((layers = ((weight = [6.0;;], bias = [6.0], σ = nothing),),), nothing)
+
+julia> dup_model  # same gradient is also stored within Duplicated
+Duplicated(
+  Chain(
+    Dense(1 => 1),                      # 2 parameters
+  ),
+  # norm(∇) ≈ 8.49
+)
+
+julia> Flux.destructure((weight = [6.0;;], bias = [6.0]))[1] |> norm
+8.48528137423857
+
+julia> Flux.gradient(dup_model, [1]; zero=false) do m, x  # implict Const([1]), and grad accumulation
+         sum(abs2, m(x))
+       end
+((layers = ((weight = [12.0;;], bias = [12.0], σ = nothing),),), nothing)
+```
+"""
+gradient(f, args::Union{EnzymeCore.Const, EnzymeCore.Duplicated}...; zero::Bool=true) = _enzyme_gradient(f, args...; zero)
+
+gradient(f, args::EnzymeCore.Const...; zero::Bool=true) = throw(ArgumentError(
+    "The method `gradient(f, xs...)` using Enzyme.jl requires at least one `Duplicated` argument, not just `Const`."
+))
+
+# FluxEnzymeExt defines more specific _enzyme_gradient(f, args::Union{Const, Duplicated}...; zero)
+_enzyme_gradient(f, args...; zero) = throw(ArgumentError(
+    "Methods like `gradient(f, x::Duplicated)` are only available when Enzyme is loaded."
+))
+
+
+"""
+    withgradient(f, args...)
+
+Returns both the value of the function and the [`gradient`](@ref), as a named tuple.
+
+By default, `Flux.withgradient` calls Zygote. If you load Enzyme, then other methods become available.
+
+# Example
+
+```
+julia> y, ∇ = withgradient(/, 1, 2)
+(val = 0.5, grad = (0.5, -0.25))
+
+julia> ∇ == gradient(/, 1, 2)
+true
+```
+
+Allows you to capture auxillary outputs, in addition to the scalar
+used by `gradient`. To do this, `f` must return a Tuple or NamedTuple.
+Then it calculates `grad = gradient(first∘f, args...)
+but returns the whole `val = f(args...)`:
+
+```jldoctest; setup=:(using Zygote)
+julia> withgradient([1,2,4]) do x
+          z = 1 ./ x
+          sum(z), z  # here z is an auxillary output
+       end
+(val = (1.75, [1.0, 0.5, 0.25]), grad = ([-1.0, -0.25, -0.0625],))
+
+julia> withgradient(3.0, 4.0) do x, y
+          (div = x/y, mul = x*y)
+       end
+(val = (div = 0.75, mul = 12.0), grad = (0.25, -0.1875))
+```
+"""
+function withgradient(f, args...; zero::Bool=true)
+    for a in args
+        a isa EnzymeCore.Duplicated && return _enzyme_withgradient(f, map(_ensure_enzyme, args)...; zero)
+    end
+    for a in args
+        _ensure_noenzyme(a)
+    end
+    if Zygote.isderiving()
+        error("""`Flux.withgradient` does not support use within a Zygote gradient.
+            If what you are doing worked on Flux < 0.14, then calling `Zygote.withgradient` directly should still work.
+            If you are writing new code, then Zygote over Zygote is heavily discouraged.
+            """)
+    end
+    Zygote.withgradient(f, args...)
+end
+
+"""
+    withgradient(f, args::Union{Const,Duplicated}...)
+
+This should return the same answer as `withgradient(f, model, args...)`,
+but it uses Enzyme.jl instead of Zygote.jl to compute the derivative.
+
+Only available when Enzyme is loaded!
+
+!!! warning "Experimental"
+    Enzyme support like this is new and somewhat experimental.
+    This method was added in Flux 0.15.
+
+# Example
+
+```julia-repl
+julia> using Flux, Enzyme
+
+julia> model = Chain(Embedding([1.1 2.2 3.3]), Dense([4.4;;]), only);
+
+julia> model(3)
+14.52
+
+julia> Flux.withgradient(m -> m(3), model)  # this uses Zygote
+(val = 14.52, grad = ((layers = ((weight = [0.0 0.0 4.4],), (weight = [3.3;;], bias = [1.0], σ = nothing), nothing),),))
+
+julia> Flux.withgradient(m -> m(3), Duplicated(model))  # this uses Enzyme
+(val = 14.52, grad = ((layers = ((weight = [0.0 0.0 4.4],), (weight = [3.3;;], bias = [1.0], σ = nothing), nothing),),))
+```
+
+The function `f` may return Tuple or NamedTuple, with the loss as the first element.
+The gradient is then `grad = gradient(first∘f, args...)`
+but the returned value is `val = f(args...)`:
+
+```julia-repl
+julia> Flux.withgradient(m -> (m(3), "aux"), Duplicated(model))
+(val = (14.52, "aux"), grad = ((layers = ((weight = [0.0 0.0 4.4],), (weight = [3.3;;], bias = [1.0], σ = nothing), nothing),),))
+
+julia> Flux.withgradient(m -> (loss=m(3), aux=round.(m.(1:3); digits=3)), Duplicated(model))
+(val = (loss = 14.52, aux = [4.84, 9.68, 14.52]), grad = ((layers = ((weight = [0.0 0.0 4.4],), (weight = [3.3;;], bias = [1.0], σ = nothing), nothing),),))
+```
+"""
+withgradient(f, args::Union{EnzymeCore.Const, EnzymeCore.Duplicated}...; zero::Bool=true) = _enzyme_withgradient(f, args...; zero)
+
+withgradient(f, args::EnzymeCore.Const...; zero::Bool=true) = throw(ArgumentError(
+    "The method `withgradient(f, xs...)` using Enzyme.jl requires at least one `Duplicated` argument, not just `Const`."
+))
+
+# FluxEnzymeExt defines more specific _enzyme_withgradient(f, args::Union{Const, Duplicated}...; zero)
+_enzyme_withgradient(f, args...; zero) = throw(ArgumentError(
+    "Methods like `withgradient(f, x::Duplicated)` are only available when Enzyme is loaded."
+))
+
+
+"""
+    testmode!(model, [mode]) -> model
+
+Set a layer, or all layers in a model, to test mode.
+This disables the effect of [`Dropout`](@ref) and
+some other regularisation layers.
+
+If you manually set a model into test mode, you need to manually place
+it back into train mode during training phase, using [`trainmode!`](@ref).
+
+There is an optional second argument, which takes a symbol `:auto` to
+reset all layers back to the default automatic mode.
+
+# Example
+
+```jldoctest
+julia> d = Dropout(0.3)
+Dropout(0.3)
+
+julia> testmode!(d)   # dropout is now always disabled
+Dropout(0.3, active=false)
+
+julia> trainmode!(d)  # dropout is now always enabled
+Dropout(0.3, active=true)
+
+julia> testmode!(d, :auto)  # back to default
+Dropout(0.3)
+```
+"""
+testmode!(m) = testmode!(m, true)
+
+
+function testmode!(m, mode)
+  inactive = if mode isa Symbol
+    mode === :auto || throw(ArgumentError(lazy"testmode! accepts only the symbol :auto, got :$mode"))
+    nothing
+  elseif mode isa Union{Bool,Nothing}
+    mode
+  else
+    throw(ArgumentError(lazy"testmode! does not accept $(repr(mode)) as the 2nd argument"))
+  end
+  foreach(x -> testmode!(x, inactive), trainable(m))
+  m
+end
+
+"""
+    trainmode!(model) -> model
+
+Set a layer, or all layers in a model, to training mode.
+Opposite to [`testmode!`](@ref), see further details there.
+"""
+trainmode!(m) = testmode!(m, false)
+trainmode!(m, mode::Symbol) = testmode!(m, mode)
+trainmode!(m, ::Nothing) = testmode!(m, nothing)  # why do we have so much API?
+
+
+
+# CPU/GPU movement conveniences
+
+"""
+    cpu(m)
+
+Copies `m` onto the CPU, the opposite of [`gpu`](@ref).
+Recurses into structs (thanks to Functors.jl).
+
+# Example
+```julia-repl
+julia> m_gpu = Dense(CUDA.randn(2, 5))
+Dense(5 => 2)       # 12 parameters
+
+julia> m_gpu.bias  # matches the given weight matrix
+2-element CuArray{Float32, 1, CUDA.Mem.DeviceBuffer}:
+ 0.0
+ 0.0
+
+julia> m = m_gpu |> cpu
+Dense(5 => 2)       # 12 parameters
+
+julia> m.bias
+2-element Vector{Float32}:
+ 0.0
+ 0.0
+```
+"""
+cpu(x) = cpu_device()(x)
+
+"""
+    gpu(m)
+
+Copies `m` to the current GPU device (using current GPU backend), if one is available.
+If no GPU is available, it does nothing (but prints a warning the first time).
+It recurses into structs according to Functors.jl.
+
+Use [`cpu`](@ref) to copy back to ordinary `Array`s.
+See also [`f32`](@ref) and [`f16`](@ref) to change element type only.
+
+This function is just defined for convenience around [`gpu_device`](@ref),
+and is equivalent to `gpu_device()(m)`.
+You may consider defining `device = gpu_device()` once and then using `device(m)` to move data.
+
+# Example
+```julia-repl
+julia> m = Dense(rand(2, 3))  # constructed with Float64 weight matrix
+Dense(3 => 2)       # 8 parameters
+
+julia> typeof(m.weight)
+Matrix{Float64} (alias for Array{Float64, 2})
+
+julia> m_gpu = gpu(m)  # can equivalently be written m_gpu = m |> gpu
+Dense(3 => 2)       # 8 parameters
+
+julia> typeof(m_gpu.weight)
+CUDA.CuArray{Float32, 2, CUDA.Mem.DeviceBuffer}
+```
+"""
+gpu(x) = gpu_device()(x)
+
+# Precision
+
+struct FluxEltypeAdaptor{T} end
+
+Adapt.adapt_storage(::FluxEltypeAdaptor{T}, x::AbstractArray{<:AbstractFloat}) where {T<:AbstractFloat} =
+  convert(AbstractArray{T}, x)
+Adapt.adapt_storage(::FluxEltypeAdaptor{T}, x::AbstractArray{<:Complex{<:AbstractFloat}}) where {T<:AbstractFloat} =
+  convert(AbstractArray{Complex{T}}, x)
+
+_paramtype(::Type{T}, m) where T = fmap(adapt(FluxEltypeAdaptor{T}()), m)
+
+# fastpath for arrays
+_paramtype(::Type{T}, x::AbstractArray{<:AbstractFloat}) where {T<:AbstractFloat} =
+  convert(AbstractArray{T}, x)
+_paramtype(::Type{T}, x::AbstractArray{<:Complex{<:AbstractFloat}}) where {T<:AbstractFloat} =
+  convert(AbstractArray{Complex{T}}, x)
+
+"""
+    f32(m)
+
+Converts the `eltype` of model's *floating point* parameters to `Float32` (which is Flux's default).
+Recurses into structs marked with [`@layer`](@ref Flux.@layer).
+
+See also [`f64`](@ref) and [`f16`](@ref).
+"""
+f32(m) = _paramtype(Float32, m)
+
+"""
+    f64(m)
+
+Converts the `eltype` of model's *floating point* parameters to `Float64`.
+Recurses into structs marked with [`@layer`](@ref Flux.@layer).
+
+See also [`f32`](@ref) and [`f16`](@ref).
+"""
+f64(m) = _paramtype(Float64, m)
+
+"""
+    f16(m)
+
+Converts the `eltype` of model's *floating point* parameters to `Float16`.
+Recurses into structs marked with [`@layer`](@ref Flux.@layer).
+
+Support for `Float16` is limited on many CPUs. Julia may
+convert to `Float32` for each operation, which is slow.
+
+See also [`f32`](@ref) and [`f64`](@ref).
+
+# Example
+```jldoctest
+julia> m = Chain(Dense(784, 2048, relu), Dense(2048, 10))  # all Float32
+Chain(
+  Dense(784 => 2048, relu),             # 1_607_680 parameters
+  Dense(2048 => 10),                    # 20_490 parameters
+)                   # Total: 4 arrays, 1_628_170 parameters, 6.211 MiB.
+
+julia> m |> f16  # takes half the memory
+Chain(
+  Dense(784 => 2048, relu),             # 1_607_680 parameters
+  Dense(2048 => 10),                    # 20_490 parameters
+)                   # Total: 4 arrays, 1_628_170 parameters, 3.106 MiB.
+```
+"""
+f16(m) = _paramtype(Float16, m)
+
+
+"""
+    gpu(data::DataLoader)
+    cpu(data::DataLoader)
+
+Transforms a given `DataLoader` to apply `gpu` or `cpu` to each batch of data,
+when iterated over. (If no GPU is available, this does nothing.)
+
+# Example
+
+```julia-repl
+julia> dl = Flux.DataLoader((x = ones(2,10), y='a':'j'), batchsize=3)
+4-element DataLoader(::NamedTuple{(:x, :y), Tuple{Matrix{Float64}, StepRange{Char, Int64}}}, batchsize=3)
+  with first element:
+  (; x = 2×3 Matrix{Float64}, y = 3-element StepRange{Char, Int64})
+
+julia> first(dl)
+(x = [1.0 1.0 1.0; 1.0 1.0 1.0], y = 'a':1:'c')
+
+julia> c_dl = gpu(dl)
+4-element DataLoader(::MLUtils.MappedData{:auto, typeof(gpu), NamedTuple{(:x, :y), Tuple{Matrix{Float64}, StepRange{Char, Int64}}}}, batchsize=3)
+  with first element:
+  (; x = 2×3 CuArray{Float32, 2, CUDA.Mem.DeviceBuffer}, y = 3-element StepRange{Char, Int64})
+
+julia> first(c_dl).x
+2×3 CuArray{Float32, 2, CUDA.Mem.DeviceBuffer}:
+ 1.0  1.0  1.0
+ 1.0  1.0  1.0
+```
+
+For large datasets, this is preferred over moving all the data to
+the GPU before creating the `DataLoader`, like this:
+
+```julia-repl
+julia> Flux.DataLoader((x = ones(2,10), y=2:11) |> gpu, batchsize=3)
+4-element DataLoader(::NamedTuple{(:x, :y), Tuple{CuArray{Float32, 2, CUDA.Mem.DeviceBuffer}, UnitRange{Int64}}}, batchsize=3)
+  with first element:
+  (; x = 2×3 CUDA.CuArray{Float32, 2, CUDA.Mem.DeviceBuffer}, y = 3-element UnitRange{Int64})
+```
+
+!!! warning
+    This only works if `gpu` is applied directly to the `DataLoader`.
+    While `gpu` acts recursively on Flux models and many basic Julia structs,
+    it will not work on (say) a tuple of `DataLoader`s.
+"""
+function gpu(d::MLUtils.DataLoader)
+  MLUtils.DataLoader(MLUtils.mapobs(gpu, d.data);
+    d.batchsize,
+    d.buffer,
+    d.partial,
+    d.shuffle,
+    d.parallel,
+    d.collate,
+    d.rng,
+  )
+end
+
+function cpu(d::MLUtils.DataLoader)
+  MLUtils.DataLoader(MLUtils.mapobs(cpu, d.data);
+    d.batchsize,
+    d.buffer,
+    d.partial,
+    d.shuffle,
+    d.parallel,
+    d.collate,
+    d.rng,
+  )
+end
+
+
+module Flux
+
+using Base: tail
+using Compat: @compat # for @compat public
+using Preferences
+using LinearAlgebra, Statistics, Random  # standard lib
+using MacroTools, Reexport, ProgressLogging, SpecialFunctions
+using MacroTools: @forward
+
+@reexport using NNlib
+using NNlib: conv, ∇conv_data, depthwiseconv, output_size
+using MLUtils
+using Adapt, OneHotArrays
+using Functors: Functors, fmap, fmapstructure
+
+using Optimisers: Optimisers, destructure, freeze!, thaw!, adjust!, trainables, update!
+import Optimisers: trainable
+@reexport using Optimisers
+
+using Random: default_rng
+
+using Zygote, ChainRulesCore
+using Zygote: @adjoint, pullback
+using Zygote.ForwardDiff: value
+using EnzymeCore: EnzymeCore
+
+@reexport using MLDataDevices: MLDataDevices, supported_gpu_backends, reset_gpu_device!,
+                    default_device_rng,
+                    gpu_device, cpu_device, xla_device,
+                    CPUDevice,
+                    CUDADevice, AMDGPUDevice, MetalDevice, oneAPIDevice,
+                    XLADevice,
+                    # get_device, # we define get_device here for retrocompatibility
+                    gpu_backend!,
+                    get_device_type,
+                    DeviceIterator
+
+export Chain, Dense, Embedding, EmbeddingBag,
+       Maxout, SkipConnection, Parallel, PairwiseFusion,
+       RNNCell, LSTMCell, GRUCell, GRUv3Cell,
+       RNN, LSTM, GRU, GRUv3, Recurrence,
+       SamePad, Conv, CrossCor, ConvTranspose, DepthwiseConv,
+       AdaptiveMaxPool, AdaptiveMeanPool, GlobalMaxPool, GlobalMeanPool, MaxPool, MeanPool,
+       Dropout, AlphaDropout,
+       LayerNorm, BatchNorm, InstanceNorm, GroupNorm, WeightNorm,
+       MultiHeadAttention,
+       Upsample, PixelShuffle,
+       fmap, cpu, gpu, f32, f64, f16, rand32, randn32, zeros32, ones32,
+       testmode!, trainmode!
+
+@compat(public, ( # unexported symbols marked as API, on Julia 1.11
+  # modules
+  Losses, Train,
+  # layers
+  Bilinear, Scale,
+  # utils
+  outputsize, state, create_bias, @layer, initialstates,
+  # from OneHotArrays.jl
+  onehot, onehotbatch, onecold,
+  # from Train
+  setup, train!,
+  # from Optimsers.jl
+  freeze!, thaw!, adjust!, update!, trainable,
+  # from Zygote.jl
+  hessian, diaghessian, jacobian, withjacobian, pullback,
+  # AD functions
+  withgradient,
+  # init
+  glorot_uniform,
+  glorot_normal,
+  kaiming_uniform,
+  kaiming_normal,
+  truncated_normal,
+  lecun_normal,
+  orthogonal,
+  sparse_init,
+  identity_init,
+  # Losses
+  binary_focal_loss,
+  binarycrossentropy,
+  crossentropy,
+  dice_coeff_loss,
+  focal_loss,
+  hinge_loss,
+  huber_loss,
+  kldivergence,
+  label_smoothing,
+  logitbinarycrossentropy,
+  logitcrossentropy,
+  mae,
+  mse,
+  msle,
+  poisson_loss,
+  siamese_contrastive_loss,
+  squared_hinge_loss,
+  tversky_loss,
+  remove_weight_norms,
+))
+
+include("gradient.jl")
+export gradient
+
+include("train.jl")
+using .Train
+using .Train: setup
+
+include("utils.jl")
+include("functor.jl")
+
+include("layers/show.jl")
+include("layers/macro.jl")
+
+include("layers/stateless.jl")
+include("layers/basic.jl")
+include("layers/conv.jl")
+include("layers/recurrent.jl")
+include("layers/normalise.jl")
+include("layers/upsample.jl")
+include("layers/attention.jl")
+
+include("loading.jl")
+
+include("outputsize.jl")
+export @autosize
+
+include("losses/Losses.jl")
+using .Losses
+
+include("devices.jl")
+export get_device
+
+# Distributed Training
+include("distributed/backend.jl")
+include("distributed/public_api.jl")
+export MPIBackend, NCCLBackend, DistributedUtils
+
+include("deprecations.jl")
+
+end # module
+
+
+get_device(x) = MLDataDevices.get_device(x)
+
+@doc (@doc MLDataDevices.get_device) get_device
+
+function (device::MLDataDevices.AbstractDevice)(d::MLUtils.DataLoader)
+    MLUtils.DataLoader(MLUtils.mapobs(device, d.data),
+        d.batchsize,
+        d.buffer,
+        d.partial,
+        d.shuffle,
+        d.parallel,
+        d.collate,
+        d.rng,
+    )
+end
+
+
+
+# v0.13 deprecations
+
+# Channel notation: Changed to match Conv, but very softly deprecated!
+# Perhaps change to @deprecate for v0.15, but there is no plan to remove these.
+Dense(in::Integer, out::Integer, σ = identity; kw...) =
+  Dense(in => out, σ; kw...)
+Bilinear(in1::Integer, in2::Integer, out::Integer, σ = identity; kw...) =
+  Bilinear((in1, in2) => out, σ; kw...)
+Embedding(in::Integer, out::Integer; kw...) = Embedding(in => out; kw...)
+
+RNNCell(in::Integer, out::Integer, σ = tanh; kw...) = RNNCell(in => out, σ; kw...)
+LSTMCell(in::Integer, out::Integer; kw...) = LSTMCell(in => out; kw...)
+
+GRUCell(in::Integer, out::Integer; kw...) = GRUCell(in => out; kw...)
+GRUv3Cell(in::Integer, out::Integer; kw...) = GRUv3Cell(in => out; kw...)
+
+
+#### v0.14 deprecations ###########################
+
+@deprecate default_rng_value() Random.default_rng()
+
+
+# Issue 2476, after ConvTranspose got a new field in 2462. Minimal fix to allow loading?
+function loadmodel!(dst::ConvTranspose, src::NamedTuple{(:σ, :weight, :bias, :stride, :pad, :dilation, :groups)}; kw...)
+  new_src = (; src.σ, src.weight, src.bias, src.stride, src.pad, dst.outpad, src.dilation, src.groups)
+  loadmodel!(dst, new_src; kw...)
+end
+
+function get_device(; verbose::Bool=false)
+  Base.depwarn("get_device() is deprecated. Use `gpu_device()` instead.", :get_device)
+  return MLDataDevices.gpu_device()
+end
+
+function get_device(backend::String, idx::Int = 0)
+  Base.depwarn("get_device(backend::String, idx::Int) is deprecated. Use `gpu_device(idx+1)` instead.", :get_device)
+  if backend == "AMD"
+      @warn "\"AMD\" backend is deprecated. Please use \"AMDGPU\" instead." maxlog=1
+      backend = "AMDGPU"
+  end
+  if backend == "CPU"
+      return cpu_device()
+  else
+      return gpu_device(idx+1, force=true)
+  end
+end
+
+function supported_devices()
+  Base.depwarn("`supported_devices()` is deprecated. Use `supported_gpu_backends()` instead.", :supported_devices)
+  return MLDataDevices.supported_gpu_backends()
+end
+
+# This was previosly documented.
+# As of v0.14.23 we silently deprecate it.
+# Later we will deprecate it loudly and then remove it.
+const GPU_BACKEND = @load_preference("gpu_backend", "CUDA")
+
+
+# help out with https://github.com/chengchingwen/Transformers.jl/issues/201
+const FluxCPUAdaptor = CPUDevice
+const FluxCUDAAdaptor = CUDADevice
+const FluxAMDGPUAdaptor = AMDGPUDevice
+const FluxMetalAdaptor = MetalDevice
+
+function reset!(x)
+  Base.depwarn("reset!(m) is deprecated. You can remove this call as it is no more needed.", :reset!)
+  return x
+end
+
+function params!(p::Zygote.Params, x, seen = Base.IdSet())
+  if x isa AbstractArray{<:Number} && Functors.isleaf(x)
+    return push!(p, x)
+  elseif x in seen
+    nothing
+  else
+    push!(seen, x)
+    for child in trainable(x)
+      params!(p, child, seen)
+    end
+  end
+end
+
+"""
+    params(model)
+
+Returns a `Zygote.Params` object containing all parameter arrays from the model.
+This is deprecated!
+This function was the cornerstone of how Flux used Zygote's implicit mode gradients,
+but since Flux 0.13 we use explicit mode `gradient(m -> loss(m, x, y), model)` instead.
+To collect all the parameter arrays for other purposes, use `Flux.trainables(model)`.
+"""
+function params(m...)
+  @warn """`Flux.params(m...)` is deprecated. Use `Flux.trainable(model)` for parameter collection,
+  and the explicit `gradient(m -> loss(m, x, y), model)` for gradient computation.""" maxlog=1
+  ps = Params()
+  params!(ps, m)
+  return ps
+end
+
+macro functor(args...)
+  @warn """The use of `Flux.@functor` is deprecated.
+      Most likely, you should write `Flux.@layer MyLayer`\
+      which will add various convenience methods for your type,\
+      such as pretty-printing and use with Adapt.jl.
+      However, this is not required. Flux.jl v0.15 uses Functors.jl v0.5,\
+      which makes exploration of most nested `struct`s opt-out instead of opt-in...\
+      so Flux will automatically see inside any custom struct definitions.
+      If you really want to apply the `@functor` macro to a custom struct, use `Functors.@functor` instead.
+      """ maxlog=1
+  # From https://discourse.julialang.org/t/calling-a-macro-from-within-a-macro-revisited/19680
+  return esc(:($Functors.@functor($(args...))))
+end
+
+# Allows caching of the parameters when params is called within gradient() to fix #2040.
+# @non_differentiable params(m...)  # https://github.com/FluxML/Flux.jl/pull/2054
+# That speeds up implicit use, and silently breaks explicit use.
+# From @macroexpand Zygote.@non_differentiable params(m...) and https://github.com/FluxML/Zygote.jl/pull/1248
+Zygote._pullback(::Zygote.Context{true}, ::typeof(params), m...) = params(m), _ -> nothing
+
+include("optimise/Optimise.jl") ## deprecated Module
+
+function Optimiser(rules...)
+  @warn "`Flux.Optimiser(...)` has been removed, please call `OptimiserChain(...)`, exported by Flux from Optimisers.jl" maxlog=1
+  OptimiserChain(rules...)
+end
+function ClipValue(val)
+  @warn "`Flux.ClipValue(...)` has been removed, please call `ClipGrad(...)`, exported by Flux from Optimisers.jl" maxlog=1
+  ClipGrad(val)
+end
+
+# TODO this friendly error should go in Optimisers.jl.
+# remove after https://github.com/FluxML/Optimisers.jl/pull/181
+function Optimisers.update!(opt::Optimisers.AbstractRule, model, grad)
+  error("""Invalid input to `update!`.
+     `update!(state, model, grad)` needs `state = Flux.setup(opt, model)`.
+    """)
+end
+
+# This exists to solve an ambiguity between the method above & one in layers/basic.jl
+function Optimisers.update!(opt::Optimisers.AbstractRule, model::Chain, grad::Tuple)
+  error("""Invalid input to `update!`.
+     `update!(state, model, grad)` needs `state = Flux.setup(opt, model)`.
+    """)
+end
+
+# From 0.15, Flux.gradient is not Zygote.gradient, but we can add a deprecation path:
+function gradient(f, p::Zygote.Params)
+  Base.depwarn("""Implicit gradients such as `gradient(f, ::Params)` are deprecated in Flux!
+    Please see the docs for new explicit form.""", :gradient; force=true)
+  Zygote.gradient(f, p)
+end
+function withgradient(f, p::Zygote.Params)
+  Base.depwarn("""Implicit gradients such as `withgradient(f, ::Params)` are deprecated in Flux!
+    Please see the docs for new explicit form.""", :withgradient; force=true)
+  Zygote.withgradient(f, p)
+end
+
+
+### v0.16 deprecations ####################
+
+
+
+# train!(loss::Function, ps::Zygote.Params, data, opt) = throw(ArgumentError(
+#   """On Flux 0.16, `train!` no longer accepts implicit `Zygote.Params`.
+#   Instead of `train!(loss_xy, Flux.params(model), data, Adam())`
+#   it now needs `opt = Flux.setup(Adam(), model); train!(loss_mxy, model, data, opt)`
+#   where `loss_mxy` accepts the model as its first argument.
+#   """
+# ))
+
+
+
+"""
+    nfan(n_out, n_in=1) -> Tuple
+    nfan(dims...)
+    nfan(dims::Tuple)
+
+For a layer characterized by dimensions `dims`, return a tuple `(fan_in, fan_out)`, where `fan_in`
+is the number of input neurons connected to an output one, and `fan_out` is the number of output neurons
+connected to an input one.
+
+This function is mainly used by weight initializers, e.g., [`kaiming_normal`](@ref Flux.kaiming_normal).
+
+# Examples
+
+```jldoctest
+julia> layer = Dense(10, 20);
+
+julia> Flux.nfan(size(layer.weight))
+(10, 20)
+
+julia> layer = Conv((3, 3), 2=>10);
+
+julia> Flux.nfan(size(layer.weight))
+(18, 90)
+```
+"""
+nfan() = 1, 1 # fan_in, fan_out
+nfan(n) = 1, n # A vector is treated as a n×1 matrix
+nfan(n_out, n_in) = n_in, n_out # In case of Dense kernels: arranged as matrices
+nfan(dims::Tuple) = nfan(dims...)
+nfan(dims...) = prod(dims[1:end-2]) .* (dims[end-1], dims[end]) # In case of convolution kernels
+
+ofeltype(x, y) = convert(float(eltype(x)), y)
+epseltype(x) = eps(float(eltype(x)))
+
+"""
+    rng_from_array(x)
+
+Create an instance of the RNG most appropriate for `x`.
+As an example, if `x` is a`CuArray`, it will return a `CUDA.default_rng()`.
+If `x` is an `Array` instead, it will return a `Random.default_rng()`.
+"""
+rng_from_array(x) = MLDataDevices.default_device_rng(MLDataDevices.get_device(x))
+
+"""
+    glorot_uniform([rng], size...; gain = 1) -> Array
+    glorot_uniform([rng]; kw...) -> Function
+
+Return an `Array{Float32}` of the given `size` containing random numbers drawn from a uniform
+distribution on the interval ``[-x, x]``, where `x = gain * sqrt(6 / (fan_in + fan_out))`.
+
+This method is described in [1] and also known as Xavier initialization.
+
+# Examples
+```jldoctest; setup = :(using Random; Random.seed!(0))
+julia> Flux.glorot_uniform(3, 4) |> summary
+"3×4 Matrix{Float32}"
+
+julia> round.(extrema(Flux.glorot_uniform(10, 100)), digits=3)
+(-0.233f0, 0.233f0)
+
+julia> round.(extrema(Flux.glorot_uniform(100, 10)), digits=3)
+(-0.234f0, 0.233f0)
+
+julia> round.(extrema(Flux.glorot_uniform(100, 100)), digits=3)
+(-0.173f0, 0.173f0)
+
+julia> Dense(3 => 2, tanh; init = Flux.glorot_uniform(MersenneTwister(1)))
+Dense(3 => 2, tanh)  # 8 parameters
+
+julia> ans.bias
+2-element Vector{Float32}:
+ 0.0
+ 0.0
+```
+
+# References
+
+[1] Glorot, Xavier, and Yoshua Bengio. "Understanding the difficulty of training deep feedforward neural networks." _Proceedings of the thirteenth international conference on artificial intelligence and statistics_. 2010.
+"""
+function glorot_uniform(rng::AbstractRNG, dims::Integer...; gain::Real=1)
+  scale = Float32(gain) * sqrt(24.0f0 / sum(nfan(dims...)))
+  (rand(rng, Float32, dims...) .- 0.5f0) .* scale
+end
+glorot_uniform(dims::Integer...; kw...) = glorot_uniform(default_rng(), dims...; kw...)
+glorot_uniform(rng::AbstractRNG=default_rng(); init_kwargs...) = (dims...; kwargs...) -> glorot_uniform(rng, dims...; init_kwargs..., kwargs...)
+
+ChainRulesCore.@non_differentiable glorot_uniform(::Any...)
+
+"""
+    glorot_normal([rng], size...; gain = 1) -> Array
+    glorot_normal([rng]; kw...) -> Function
+
+Return an `Array{Float32}` of the given `size` containing random numbers drawn from a normal
+distribution with standard deviation `gain * sqrt(2 / (fan_in + fan_out))`,
+using [`nfan`](@ref Flux.nfan).
+
+This method is described in [1] and also known as Xavier initialization.
+
+# Examples
+```jldoctest; setup = :(using Random; Random.seed!(0))
+julia> using Statistics
+
+julia> round(std(Flux.glorot_normal(10, 1000)), digits=3)
+0.044f0
+
+julia> round(std(Flux.glorot_normal(1000, 10)), digits=3)
+0.045f0
+
+julia> round(std(Flux.glorot_normal(1000, 1000)), digits=3)
+0.032f0
+
+julia> Dense(10 => 1000, tanh; init = Flux.glorot_normal(gain=100))
+Dense(10 => 1000, tanh)  # 11_000 parameters
+
+julia> round(std(ans.weight), sigdigits=3)
+4.45f0
+```
+
+# References
+
+[1] Glorot, Xavier, and Yoshua Bengio. "Understanding the difficulty of training deep feedforward neural networks." _Proceedings of the thirteenth international conference on artificial intelligence and statistics_. 2010.
+"""
+function glorot_normal(rng::AbstractRNG, dims::Integer...; gain::Real=1)
+  std = Float32(gain) * sqrt(2.0f0 / sum(nfan(dims...)))
+  randn(rng, Float32, dims...) .* std
+end
+glorot_normal(dims::Integer...; kwargs...) = glorot_normal(default_rng(), dims...; kwargs...)
+glorot_normal(rng::AbstractRNG=default_rng(); init_kwargs...) = (dims...; kwargs...) -> glorot_normal(rng, dims...; init_kwargs..., kwargs...)
+
+ChainRulesCore.@non_differentiable glorot_normal(::Any...)
+
+"""
+    kaiming_uniform([rng], size...; gain = √2) -> Array
+    kaiming_uniform([rng]; kw...) -> Function
+
+Return an `Array{Float32}` of the given `size` containing random numbers drawn from a uniform distribution
+on the interval `[-x, x]`, where `x = gain * sqrt(3/fan_in)` using [`nfan`](@ref Flux.nfan).
+
+This method is described in [1] and also known as He initialization.
+
+# Examples
+```jldoctest; setup = :(using Random; Random.seed!(0))
+julia> round.(extrema(Flux.kaiming_uniform(100, 10)), digits=3)
+(-0.774f0, 0.773f0)
+
+julia> round.(extrema(Flux.kaiming_uniform(10, 100)), digits=3)
+(-0.243f0, 0.245f0)
+
+julia> round.(extrema(Flux.kaiming_uniform(100, 100)), digits=3)
+(-0.245f0, 0.245f0)
+```
+
+# References
+
+[1] He, Kaiming, et al. "Delving deep into rectifiers: Surpassing human-level performance on imagenet classification." _Proceedings of the IEEE international conference on computer vision_. 2015.
+"""
+function kaiming_uniform(rng::AbstractRNG, dims::Integer...; gain::Real = √2)
+  bound = Float32(√3 * gain / sqrt(first(nfan(dims...)))) # fan_in
+  return (rand(rng, Float32, dims...) .- 0.5f0) .* 2bound
+end
+
+kaiming_uniform(dims::Integer...; kwargs...) = kaiming_uniform(default_rng(), dims...; kwargs...)
+kaiming_uniform(rng::AbstractRNG=default_rng(); init_kwargs...) = (dims...; kwargs...) -> kaiming_uniform(rng, dims...; init_kwargs..., kwargs...)
+
+ChainRulesCore.@non_differentiable kaiming_uniform(::Any...)
+
+"""
+    kaiming_normal([rng], size...; gain = √2) -> Array
+    kaiming_normal([rng]; kw...) -> Function
+
+Return an `Array{Float32}` of the given `size` containing random numbers taken from a normal
+distribution standard deviation `gain / sqrt(fan_in)`, using [`nfan`](@ref Flux.nfan).
+
+This method is described in [1] and also known as He initialization.
+
+# Examples
+```jldoctest; setup = :(using Random; Random.seed!(0))
+julia> using Statistics
+
+julia> round(std(Flux.kaiming_normal(10, 1000)), digits=3)
+0.044f0
+
+julia> round(std(Flux.kaiming_normal(1000, 10)), digits=3)
+0.45f0
+
+julia> round(std(Flux.kaiming_normal(1000, 1000)), digits=3)
+0.045f0
+```
+
+# References
+
+[1] He, Kaiming, et al. "Delving deep into rectifiers: Surpassing human-level performance on imagenet classification." _Proceedings of the IEEE international conference on computer vision_. 2015.
+"""
+function kaiming_normal(rng::AbstractRNG, dims::Integer...; gain::Real = √2f0)
+  std = Float32(gain / sqrt(first(nfan(dims...)))) # fan_in
+  return randn(rng, Float32, dims...) .* std
+end
+
+kaiming_normal(dims::Integer...; kwargs...) = kaiming_normal(default_rng(), dims...; kwargs...)
+kaiming_normal(rng::AbstractRNG; init_kwargs...) = (dims...; kwargs...) -> kaiming_normal(rng, dims...; init_kwargs..., kwargs...)
+
+ChainRulesCore.@non_differentiable kaiming_normal(::Any...)
+
+"""
+    truncated_normal([rng], size...; mean = 0, std = 1, lo = -2, hi = 2) -> Array
+    truncated_normal([rng]; kw...) -> Function
+
+Return an `Array{Float32}` of the given `size` where each element is drawn from a truncated normal distribution.
+The numbers are distributed like `filter(x -> lo<=x<=hi, mean .+ std .* randn(100))`.
+
+The values are generated by sampling a Uniform(0, 1) (`rand()`) and then
+applying the inverse CDF of the truncated normal distribution.
+This method works best when `lo ≤ mean ≤ hi`.
+
+# Examples
+```jldoctest
+julia> using Statistics
+
+julia> Flux.truncated_normal(3, 4) |> summary
+"3×4 Matrix{Float32}"
+
+julia> round.(extrema(Flux.truncated_normal(10^6)); digits=3)
+(-2.0f0, 2.0f0)
+
+julia> round(std(Flux.truncated_normal(10^6; lo = -100, hi = 100)))
+1.0f0
+```
+"""
+function truncated_normal(rng::AbstractRNG, dims::Integer...; mean = 0, std = 1, lo = -2, hi = 2)
+  norm_cdf(x) = 0.5 * (1 + erf(x/√2))
+  if (mean < lo - 2 * std) || (mean > hi + 2 * std)
+    @warn "Mean is more than 2 std outside the limits in truncated_normal, so the distribution of values may be inaccurate." maxlog=1
+  end
+  l = norm_cdf((lo - mean) / std)
+  u = norm_cdf((hi - mean) / std)
+  xs = rand(rng, Float32, dims...)
+  broadcast!(xs, xs) do x
+    x = x * 2(u - l) + (2l - 1)
+    x = erfinv(x)
+    x = clamp(x * std * √2 + mean, lo, hi)
+  end
+  return xs
+end
+
+truncated_normal(dims::Integer...; kwargs...) = truncated_normal(default_rng(), dims...; kwargs...)
+truncated_normal(rng::AbstractRNG=default_rng(); init_kwargs...) = (dims...; kwargs...) -> truncated_normal(rng, dims...; init_kwargs..., kwargs...)
+
+ChainRulesCore.@non_differentiable truncated_normal(::Any...)
+
+"""
+    lecun_normal([rng], size...) -> Array
+    lecun_normal([rng]; kw...) -> Function
+
+Return an `Array{Float32}` of the given `size` containing random numbers drawn from a truncated normal
+distribution centered on 0 with stddev `sqrt(1 / fan_in)`, where `fan_in` is the number of input units
+in the weight tensor.
+
+# Examples
+```jldoctest; setup = :(using Random; Random.seed!(0))
+julia> using Statistics
+
+julia> round(std(Flux.lecun_normal(10, 1000)), digits=3)
+0.032f0
+
+julia> round(std(Flux.lecun_normal(1000, 10)), digits=3)
+0.32f0
+
+julia> round(std(Flux.lecun_normal(1000, 1000)), digits=3)
+0.032f0
+
+julia> Dense(10 => 1000, selu; init = Flux.lecun_normal())
+Dense(10 => 1000, selu)  # 11_000 parameters
+
+julia> round(std(ans.weight), digits=3)
+0.313f0
+```
+
+# References
+
+[1] Lecun, Yann, et al. "Efficient backprop." Neural networks: Tricks of the trade. Springer, Berlin, Heidelberg, 2012. 9-48.
+"""
+function lecun_normal(rng::AbstractRNG, dims::Integer...; gain::Real=1)
+  std = Float32(gain)*sqrt(1.0f0 / first(nfan(dims...))) # calculates the standard deviation based on the `fan_in` value
+  return truncated_normal(rng, dims...; mean=0, std=std)
+end
+
+lecun_normal(dims::Integer...; kwargs...) = lecun_normal(default_rng(), dims...; kwargs...)
+lecun_normal(rng::AbstractRNG=default_rng(); init_kwargs...) = (dims...; kwargs...) -> lecun_normal(rng, dims...; init_kwargs..., kwargs...)
+
+ChainRulesCore.@non_differentiable lecun_normal(::Any...)
+
+"""
+    orthogonal([rng], size...; gain = 1) -> Array
+    orthogonal([rng]; kw...) -> Function
+
+Return an `Array{Float32}` of the given `size` which is a (semi) orthogonal matrix, as described in [1].
+
+Cannot construct a vector, i.e. `length(size) == 1` is forbidden.
+For `length(size) > 2`, a `prod(size[1:(end - 1)])` by `size[end]` orthogonal matrix
+is computed before reshaping it to the original dimensions.
+
+# Examples
+```jldoctest; setup = :(using LinearAlgebra)
+julia> W = Flux.orthogonal(5, 7);
+
+julia> summary(W)
+"5×7 Matrix{Float32}"
+
+julia> W * W' ≈ I(5)
+true
+
+julia> W2 = Flux.orthogonal(7, 5);
+
+julia> W2 * W2' ≈ I(7)
+false
+
+julia> W2' * W2 ≈ I(5)
+true
+
+julia> W3 = Flux.orthogonal(3, 3, 2, 4);
+
+julia> transpose(reshape(W3, :, 4)) * reshape(W3, :, 4) ≈ I(4)
+true
+```
+
+# References
+
+[1] Saxe, McClelland, Ganguli. "Exact solutions to the nonlinear dynamics of learning in deep linear neural networks", ICLR 2014, https://arxiv.org/abs/1312.6120
+
+"""
+function orthogonal(rng::AbstractRNG, rows::Integer, cols::Integer; gain::Real = 1)
+  if rows < cols
+    return permutedims(orthogonal(rng, cols, rows; gain))
+  end
+  mat = randn(rng, Float32, rows, cols)
+  Q, R = LinearAlgebra.qr(mat)
+  mat .= Array(Q) * sign.(LinearAlgebra.Diagonal(R)) .* Float32(gain)
+  return mat
+end
+
+function orthogonal(rng::AbstractRNG, d1::Integer, ds::Integer...; kwargs...)
+  dims = (d1, ds...)
+  rows = prod(dims[1:end-1])
+  cols = dims[end]
+  return reshape(orthogonal(rng, rows, cols; kwargs...), dims)
+end
+
+orthogonal(dims::Integer...; kwargs...) = orthogonal(default_rng(), dims...; kwargs...)
+orthogonal(rng::AbstractRNG=default_rng(); init_kwargs...) = (dims::Integer...; kwargs...) -> orthogonal(rng, dims...; init_kwargs..., kwargs...)
+
+ChainRulesCore.@non_differentiable orthogonal(::Any...)
+
+"""
+    sparse_init([rng], rows, cols; sparsity, std = 0.01) -> Array
+    sparse_init([rng]; kw...) -> Function
+
+Return a `Matrix{Float32}` of size `rows, cols` where each column contains a fixed fraction of
+zero elements given by `sparsity`. Non-zero elements are normally distributed
+with a mean of zero and standard deviation `std`.
+
+This method is described in [1].
+
+# Examples
+```jldoctest; setup = :(using Random; Random.seed!(0))
+julia> count(iszero, Flux.sparse_init(10, 10, sparsity=1/5))
+20
+
+julia> sum(0 .== Flux.sparse_init(10, 11, sparsity=0.9), dims=1)
+1×11 Matrix{Int64}:
+ 9  9  9  9  9  9  9  9  9  9  9
+
+julia> Dense(3 => 10, tanh; init=Flux.sparse_init(sparsity=0.5))
+Dense(3 => 10, tanh)  # 40 parameters
+
+julia> count(iszero, ans.weight, dims=1)
+1×3 Matrix{Int64}:
+ 5  5  5
+```
+
+# References
+
+[1] Martens, J, "Deep learning via Hessian-free optimization" _Proceedings of the 27th International Conference on International Conference on Machine Learning_. 2010.
+"""
+function sparse_init(rng::AbstractRNG, dims::Integer...; sparsity, std = 0.01)
+  if length(dims) != 2
+    throw(ArgumentError("Only 2-dimensional outputs are supported for sparse initialization."))
+  end
+  rows, cols = dims
+  prop_zero = min(1.0, sparsity)
+  num_zeros = ceil(Integer, prop_zero * rows)
+  sparse_array = randn(rng, Float32, dims...) .* Float32(std)
+  sparse_array[1:num_zeros, :] .= 0f0
+  return mapslices(shuffle, sparse_array, dims=1)
+end
+
+sparse_init(dims::Integer...; kwargs...) = sparse_init(default_rng(), dims...; kwargs...)
+sparse_init(rng::AbstractRNG=default_rng(); init_kwargs...) = (dims...; kwargs...) -> sparse_init(rng, dims...; init_kwargs..., kwargs...)
+
+ChainRulesCore.@non_differentiable sparse_init(::Any...)
+
+"""
+    identity_init(size...; gain=1, shift=0) -> Array
+    identity_init(; kw...) -> Function
+
+Return an `Array{Float32}` of the given `size` which yields an identity mapping when used as parameters in
+most Flux layers. Use `gain` to scale the identity by a constant.
+
+Often useful in the context of transfer learning, i.e when one wants to add more capacity to
+a model but start from the same mapping.
+
+Has the following behaviour
+*  1D: A `Vector` of `zeros` (useful for an identity bias)
+*  2D: An identity matrix (useful for an identity matrix multiplication)
+*  More than 2D: A dense block array of center tap spatial filters (useful for an identity convolution)
+
+Some caveats:
+* Not all layers will be identity mapping when used with this init. Exceptions
+  include recurrent layers and normalization layers.
+
+* Layers must have `input_size == output_size` for identity mapping to be
+  possible. When this is not the case, extra dimensions of the array are padded with zeros.
+
+* For convolutional layers, in addition to the above, the kernel sizes must also be odd and
+  padding must be applied so that output feature maps have the same size as input feature maps,
+  e.g by using [`SamePad`](@ref).
+
+Use keyword `shift` (integer or tuple) to apply circular shift to the output,
+equivalent to `Base.circshift(identity_init(size...), shift)`.
+
+For consistency with other initialisers, it accepts `rng::AbstractRNG` as an optional
+first argument. But this is ignored, since the result is not random.
+
+# Examples
+```jldoctest
+julia> Flux.identity_init(3,5)
+3×5 Matrix{Float32}:
+ 1.0  0.0  0.0  0.0  0.0
+ 0.0  1.0  0.0  0.0  0.0
+ 0.0  0.0  1.0  0.0  0.0
+
+julia> Dense(5 => 3, relu, init=Flux.identity_init)([1,-2,3,-4,5])
+3-element Vector{Float32}:
+ 1.0
+ 0.0
+ 3.0
+
+julia> Flux.identity_init(3,3,2; gain=100)
+3×3×2 Array{Float32, 3}:
+[:, :, 1] =
+   0.0  0.0  0.0
+ 100.0  0.0  0.0
+   0.0  0.0  0.0
+
+[:, :, 2] =
+ 0.0    0.0  0.0
+ 0.0  100.0  0.0
+ 0.0    0.0  0.0
+
+julia> x4 = cat([1 2 3; 4 5 6; 7 8 9]; dims=4);
+
+julia> Conv((2,2), 1 => 1, init=Flux.identity_init(gain=10), pad=SamePad())(x4)
+3×3×1×1 Array{Float32, 4}:
+[:, :, 1, 1] =
+ 10.0  20.0  30.0
+ 40.0  50.0  60.0
+ 70.0  80.0  90.0
+```
+"""
+identity_init(cols::Integer; gain::Real=1, shift=0) = zeros32(cols) # Assume bias
+
+# Assume matrix multiplication
+identity_init(rows::Integer, cols::Integer; gain::Real=1, shift=0) = circshift(Matrix{Float32}(I * gain, rows,cols), shift)
+
+# Assume convolution
+function identity_init(dims::Integer...; gain::Real=1, shift=0)
+  nin, nout = dims[end-1], dims[end]
+  centers = map(d -> cld(d, 2), dims[1:end-2])
+  weights = zeros32(dims...)
+  for i in 1:min(nin,nout)
+    weights[centers..., i, i] = gain
+  end
+  return circshift(weights, shift)
+end
+
+# For consistency, it accepts an RNG, but ignores it:
+identity_init(::AbstractRNG, dims::Integer...; kwargs...) = identity_init(dims...; kwargs...)
+identity_init(rng::AbstractRNG=default_rng(); init_kwargs...) = (args...;kwargs...) -> identity_init(rng, args...; init_kwargs..., kwargs...)
+
+ChainRulesCore.@non_differentiable identity_init(::Any...)
+
+"""
+    ones32(size...) = ones(Float32, size...)
+
+Return an `Array{Float32}` of the given `size` filled with 1s.
+"""
+ones32(dims...) = Base.ones(Float32, dims...)
+
+"""
+    zeros32(size...) = zeros(Float32, size...)
+
+Return an `Array{Float32}` of the given `size` filled with 0s.
+"""
+zeros32(dims...) = Base.zeros(Float32, dims...)
+
+"""
+    rand32([rng], size...)
+
+Return an `Array{Float32}` of the given `size`, filled like `rand`.
+When the size is not provided, `rand32(rng::AbstractRNG)` returns a function.
+"""
+rand32(dims::Integer...) = Base.rand(Float32, dims...)
+rand32(rng::AbstractRNG, dims::Integer...) = Base.rand(rng, Float32, dims...)
+rand32(rng::AbstractRNG) = (dims...,) -> Base.rand(rng, Float32, dims...)
+
+"""
+    randn32([rng], size...)
+
+Return an `Array{Float32}` of the given `size`, filled like `randn`.
+When the size is not provided, `randn32(rng::AbstractRNG)` returns a function.
+"""
+randn32(dims::Integer...) = Base.randn(Float32, dims...)
+randn32(rng::AbstractRNG, dims::Integer...) = Base.randn(rng, Float32, dims...)
+randn32(rng::AbstractRNG) = (dims...,) -> Base.randn(rng, Float32, dims...)
+
+"""
+    create_bias(weights, bias, size...)
+
+Return a bias parameter for a layer, based on the value given
+to the constructor's keyword `bias=bias`.
+
+* `bias == true` creates a trainable array of the given size, of the same type as `weights`, initialised to zero.
+* `bias == false` returns `false`, which is understood by AD to be non-differentiable.
+* `bias::AbstractArray` uses the array provided, provided it has the correct size.
+  It will also correct the `eltype` to match that of `weights`.
+"""
+function create_bias(weights::AbstractArray, bias::Bool, dims::Integer...)
+  bias ? fill!(similar(weights, dims...), 0) : false
+end
+function create_bias(weights::AbstractArray, bias::AbstractArray, dims::Integer...)
+  size(bias) == dims || throw(DimensionMismatch("expected bias of size $(dims), got size $(size(bias))"))
+  convert(AbstractArray{_eltype(weights)}, bias)
+end
+
+# This avoids the issue that Tracker.TrackedArray{Float64} declares eltype() = TrackedReal
+_eltype(::AbstractArray{T}) where T = T
+
+
+# Other
+
+"""
+    throttle(f, timeout; leading=true, trailing=false)
+
+Return a function that when invoked, will only be triggered at most once
+during `timeout` seconds.
+
+Normally, the throttled function will run as much as it can, without ever
+going more than once per `wait` duration; but if you'd like to disable the
+execution on the leading edge, pass `leading=false`. To enable execution on
+the trailing edge, pass `trailing=true`.
+
+# Examples
+```jldoctest
+julia> a = Flux.throttle(() -> println("Flux"), 2);
+
+julia> for i = 1:4  # a called in alternate iterations
+           a()
+           sleep(1)
+       end
+Flux
+Flux
+```
+"""
+function throttle(f, timeout; leading=true, trailing=false)
+  cooldown = true
+  later = nothing
+  result = nothing
+
+  function throttled(args...; kwargs...)
+    yield()
+
+    if cooldown
+      if leading
+        result = f(args...; kwargs...)
+      else
+        later = () -> f(args...; kwargs...)
+      end
+
+      cooldown = false
+      @async try
+        while (sleep(timeout); later != nothing)
+          later()
+          later = nothing
+        end
+      finally
+        cooldown = true
+      end
+    elseif trailing
+      later = () -> (result = f(args...; kwargs...))
+    end
+
+    return result
+  end
+end
+
+
+"""
+    modules(m)
+
+Return an iterator over non-leaf objects
+that can be reached by recursing `m` over
+the children given by [`Functors.functor`](@ref).
+
+Useful for applying a function (e.g. a regularizer)
+over specific modules or subsets of the parameters
+(e.g. the weights but not the biases).
+
+# Examples
+
+```jldoctest
+julia> m1 = Chain(Dense(28^2, 64), BatchNorm(64, relu));
+
+julia> m2 = Chain(m1, Dense(64, 10))
+Chain(
+  Chain(
+    Dense(784 => 64),                   # 50_240 parameters
+    BatchNorm(64, relu),                # 128 parameters, plus 128
+  ),
+  Dense(64 => 10),                      # 650 parameters
+)         # Total: 6 trainable arrays, 51_018 parameters,
+          # plus 2 non-trainable, 128 parameters, summarysize 200.211 KiB.
+
+julia> Flux.modules(m2)
+7-element Vector{Any}:
+ Chain(Chain(Dense(784 => 64), BatchNorm(64, relu)), Dense(64 => 10))  # 51_018 parameters, plus 128 non-trainable
+ (Chain(Dense(784 => 64), BatchNorm(64, relu)), Dense(64 => 10))
+ Chain(Dense(784 => 64), BatchNorm(64, relu))  # 50_368 parameters, plus 128 non-trainable
+ (Dense(784 => 64), BatchNorm(64, relu))
+ Dense(784 => 64)    # 50_240 parameters
+ BatchNorm(64, relu)  # 128 parameters, plus 128 non-trainable
+ Dense(64 => 10)     # 650 parameters
+
+julia> L2(m) = sum(sum(abs2, l.weight) for l in Flux.modules(m) if l isa Dense)
+L2 (generic function with 1 method)
+
+julia> L2(m2) isa Float32
+true
+```
+"""
+modules(m) = [x for x in Functors.fcollect(m) if !isleaflike(x)]
+
+@non_differentiable modules(::Any...) # TODO: is this correct? might fail with explicit parameters.
+function ChainRulesCore.rrule(::typeof(modules), m)
+  modules(m), dm -> error("Flux.modules is not at present differentiable, sorry")
+end
+
+isleaflike(x) = Functors.isleaf(x)
+
+# these are, essentially, Tuple{Vararg{T}} using the special property
+# of tuples that they are type covariant.  Using <: here causes warning or error
+isleaflike(::Tuple{Vararg{Number}}) = true
+isleaflike(::Tuple{Vararg{AbstractArray{<:Number}}}) = true
+
+"""
+    patience(predicate, wait)
+
+Return a function that internally counts by one when
+`predicate(...) == true`, otherwise the count is reset to zero.
+If the count is greater than or equal to `wait`,
+the function returns `true`, otherwise it returns `false`.
+
+# Examples
+```jldoctest
+julia> loss() = rand();
+
+julia> trigger = Flux.patience(() -> loss() < 1, 3);
+
+
+julia> for i in 1:10
+         @info "Epoch \$i"
+         trigger() && break
+       end
+[ Info: Epoch 1
+[ Info: Epoch 2
+[ Info: Epoch 3
+```
+"""
+function patience(predicate, wait)
+  let count = 0
+    function on_trigger(args...; kwargs...)
+      count = predicate(args...; kwargs...) ? count + 1 : 0
+
+      return count >= wait
+    end
+  end
+end
+
+"""
+    early_stopping(f, delay; distance = -, init_score = 0, min_dist = 0)
+
+Return a function that internally counts by one when
+`distance(best_score, f(...)) <= min_dist`, where
+`best_score` is the last seen best value of `f(...)`.
+If the count is greater than or equal to `delay`,
+the function returns `true`, otherwise it returns `false`.
+The count is reset when `distance(best_score, f(...)) > min_dist`.
+
+# Examples
+```jldoctest
+julia> loss = let l = 0
+         () -> l += 1
+       end; # pseudo loss function that returns increasing values
+
+julia> es = Flux.early_stopping(loss, 3);
+
+
+julia> for i in 1:10
+         @info "Epoch \$i"
+         es() && break
+       end
+[ Info: Epoch 1
+[ Info: Epoch 2
+[ Info: Epoch 3
+```
+"""
+function early_stopping(f, delay; distance = -, init_score = 0, min_dist = 0)
+  trigger = let best_score = init_score
+    (args...; kwargs...) -> begin
+      score = f(args...; kwargs...)
+      Δ = distance(best_score, score)
+      best_score = Δ < 0 ? best_score : score
+
+      return Δ < min_dist
+    end
+  end
+
+  return patience(trigger, delay)
+end
+
+"""
+    plateau(f, width; distance = -, init_score = 0, min_dist = 1f-6)
+
+Return a function that internally counts by one when
+`abs(distance(last_score, f(...))) <= min_dist`, where
+`last_score` holds the last value of `f(...)`.
+If the count is greater than or equal to `width`,
+the function returns `true`, otherwise it returns `false`.
+The count is reset when `abs(distance(last_score, f(...))) > min_dist`.
+
+# Examples
+```jldoctest
+julia> f = let v = 10
+         () -> v = v / abs(v) - v
+       end; # -9, 8, -7, 6, ...
+
+julia> trigger = Flux.plateau(f, 3; init_score=10, min_dist=18);
+
+
+julia> for i in 1:10
+         @info "Epoch \$i"
+         trigger() && break
+       end
+[ Info: Epoch 1
+[ Info: Epoch 2
+[ Info: Epoch 3
+[ Info: Epoch 4
+```
+"""
+function plateau(f, width; distance = -, init_score = 0, min_dist = 1f-6)
+  is_plateau = let last_score = init_score
+    (args...; kwargs...) -> begin
+      score = f(args...; kwargs...)
+      Δ = abs(distance(last_score, score))
+      last_score = score
+
+      return Δ < min_dist
+    end
+  end
+
+  return patience(is_plateau, width)
+end
+
+
+module Train
+
+using LinearAlgebra
+using Optimisers: Optimisers
+using Functors: fmap, fmapstructure
+using ..Flux: Flux
+
+using ProgressLogging: @progress, @withprogress, @logprogress
+using Zygote: Zygote
+
+export setup, train!
+
+using ProgressLogging: @progress, @withprogress, @logprogress
+using Zygote: Zygote
+using EnzymeCore: Duplicated
+
+"""
+    opt_state = setup(rule, model)
+
+This is a version of `Optimisers.setup`, and is the first step before using [`train!`](@ref Flux.train!).
+It differs from `Optimisers.setup` in that it:
+* has one extra check for mutability (since Flux expects to mutate the model in-place,
+  while Optimisers.jl is designed to return an updated model)
+* has methods which accept Flux's old optimisers, and convert them.
+  (The old `Flux.Optimise.Adam` and new `Optimisers.Adam` are distinct types.)
+
+# Example
+```jldoctest
+julia> model = Dense(2 => 1, leakyrelu; init=ones);
+
+julia> opt_state = Flux.setup(Momentum(0.1), model)  # this encodes the optimiser and its state
+(weight = Leaf(Momentum(0.1, 0.9), [0.0 0.0]), bias = Leaf(Momentum(0.1, 0.9), [0.0]), σ = ())
+
+julia> x1, y1 = [0.2, -0.3], [0.4];  # use the same data for two steps:
+
+julia> Flux.train!(model, [(x1, y1), (x1, y1)], opt_state) do m, x, y
+         sum(abs.(m(x) .- y)) * 100
+       end
+
+julia> model.bias  # was zero, mutated by Flux.train!
+1-element Vector{Float64}:
+ 10.19
+
+julia> opt_state  # mutated by Flux.train!
+(weight = Leaf(Momentum(0.1, 0.9), [-2.018 3.027]), bias = Leaf(Momentum(0.1, 0.9), [-10.09]), σ = ())
+```
+"""
+function setup(rule::Optimisers.AbstractRule, model)
+    state = Optimisers.setup(rule, model)
+    # This check only needs foreach; using fmap caused https://github.com/FluxML/Flux.jl/issues/2144
+    fmapstructure(model, exclude = Optimisers.isnumeric) do x
+      Optimisers.maywrite(x) || error("""model must be fully mutable for `train!` to work, got `x::$(typeof(x))`.
+                                         If `x .+= dx` is in fact ok, define `Optimisers.maywrite(::$(typeof(x))) = true`""")
+    end
+    return state
+end
+
+"""
+    opt_state = setup(rule, model::Duplicated) = setup(rule, model.val)
+
+Special method for use with Enzyme.jl, ignores the stored gradient.
+"""
+setup(rule::Optimisers.AbstractRule, model::Duplicated) = setup(rule, model.val)
+
+"""
+    train!(loss, model, data, opt_state)
+
+Uses a `loss` function and training `data` to improve the `model`'s parameters
+according to a particular optimisation rule encoded in `opt_state`.
+Iterates through `data` once, evaluating for each `d in data` either
+`loss(model, d...)` if `d isa Tuple`, or else `loss(model, d)` for other `d`.
+
+If `model` is an Enzyme.Duplicated and `Enzyme.jl` is loaded, gradients will be computed with Enzyme,
+otherwise they will be computed with Zygote.
+
+For example, with these definitions...
+```
+data = [(x1, y1), (x2, y2), (x3, y3)]
+
+loss3(m, x, y) = norm(m(x) .- y)        # the model is the first argument
+
+opt_state = Flux.setup(Adam(), model)   # explicit setup of optimiser momenta
+```
+...calling `Flux.train!(loss3, model, data, opt_state)` runs a loop much like this:
+```
+for d in data
+    ∂L∂m = gradient(loss3, model, d...)[1]
+    update!(opt_state, model, ∂L∂m)
+end
+```
+You can also write this loop yourself, if you need more flexibility.
+For this reason `train!` is not highly extensible.
+It adds only a few features to the loop above:
+
+* Stop with a `DomainError` if the loss is infinite or `NaN` at any point.
+
+* Show a progress bar using [`@withprogress`](https://github.com/JuliaLogging/ProgressLogging.jl).
+
+!!! compat "New"
+    This method was added in Flux 0.13.9.
+    It has significant changes from the one used by Flux ≤ 0.13:
+    * It now takes the `model` itself, not the result of `Flux.params`.
+      (This is to move away from Zygote's "implicit" parameter handling, with `Grads`.)
+    * Instead of `loss` being a function which accepts only the data,
+      now it must also accept the `model` itself, as the first argument.
+    * `opt_state` should be the result of [`Flux.setup`](@ref). Using an optimiser
+      such as `Adam()` without this step should give you a warning.
+    * Callback functions are not supported.
+      (But any code can be included in the above `for` loop.)
+"""
+function train!(loss, model, data, opt; cb = nothing)
+  isnothing(cb) || error("""train! does not support callback functions.
+                            For more control use a loop with `gradient` and `update!`.""")
+  @withprogress for (i,d) in enumerate(data)
+    d_splat = d isa Tuple ? d : (d,)
+
+    l, gs = Zygote.withgradient(m -> loss(m, d_splat...), model)
+
+    if !isfinite(l)
+      throw(DomainError(lazy"Loss is $l on data item $i, stopping training"))
+    end
+
+    opt, model = Optimisers.update!(opt, model, gs[1])
+
+    @logprogress Base.haslength(data) ? i/length(data) : nothing
+  end
+end
+
+
+# This method let you use Optimisers.Descent() without setup, when there is no state
+function train!(loss, model, data, rule::Optimisers.AbstractRule; cb = nothing)
+  train!(loss, model, data, _rule_to_state(model, rule); cb)
+end
+
+function _rule_to_state(model, rule::Optimisers.AbstractRule)
+  state = setup(rule, model)
+  @gensym warn_id
+  name = typeof(rule).name.name
+  fmap(state, exclude = x -> x isa Optimisers.Leaf) do leaf
+    leaf.state isa Nothing ||  @warn """Optimiser $name has state which will be discarded after `train!` finishes.
+                                        Please run `opt = Flux.setup($name(), model)` and pass this `opt` to `train!`.""" leaf maxlog=1 _id=warn_id
+    leaf
+  end
+  state
+end
+
+"""
+    train!(loss, Duplicated(model), data, opt_state)
+
+This method uses Enzyme.jl instead of Zygote.jl to compute the gradients,
+but is otherwise the same as `train!(loss, model, data, opt_state)`.
+
+Only available when Enzyme is loaded.
+
+!!! compat "New"
+    This method was added in Flux 0.13.9.
+
+"""
+train!(loss, model::Duplicated, data, opt; cb = nothing) = _enzyme_train!(loss, model, data, opt; cb = nothing)
+
+# FluxEnzymeExt defines more specific _enzyme_train!(loss, model::Duplicated, data, opt; cb)
+_enzyme_train!(loss, model, data, opt; cb = nothing) = throw(ArgumentError("The method `train!(loss, Duplicated(model), data, opt_state)` is only available when Enzyme.jl is loaded"))
+
+# This method let you use Optimisers.Descent() without setup, when there is no state
+function train!(loss, model::Duplicated, data, rule::Optimisers.AbstractRule; cb=nothing)
+  train!(loss, model, data, _rule_to_state(model, rule); cb)
+end
+
+end # module Train
+
+
+
+
+
+
+//
+
+ 1. 2  Chapter 4: Under the Hood: Training a Digit Classifier <file:///
+    C:/CodeFromBooks/julia-deeplearning-book-main/julia-deeplearning-
+    book-main/docs/chapters/c4.html>
+
+//
+
+Julia for Deep Learning <file:///C:/CodeFromBooks/julia-deeplearning-
+book-main/julia-deeplearning-book-main/docs/> // <https://github.com/
+pat-alt/julia-deeplearning-book> // <https://twitter.com/intent/tweet?
+url=|url|>
+
+//
+
+  *
+    Preface <file:///C:/CodeFromBooks/julia-deeplearning-book-main/
+    julia-deeplearning-book-main/docs/index.html>
+  *
+    1  Introduction <file:///C:/CodeFromBooks/julia-deeplearning-book-
+    main/julia-deeplearning-book-main/docs/intro.html>
+  *
+    2  Chapter 4: Under the Hood: Training a Digit Classifier <file:///
+    C:/CodeFromBooks/julia-deeplearning-book-main/julia-deeplearning-
+    book-main/docs/chapters/c4.html>
+  *
+    3  Chapter 5: Image Classification <file:///C:/CodeFromBooks/julia-
+    deeplearning-book-main/julia-deeplearning-book-main/docs/chapters/
+    c5.html>
+  *
+    4  Summary <file:///C:/CodeFromBooks/julia-deeplearning-book-main/
+    julia-deeplearning-book-main/docs/summary.html>
+  *
+    5  Contributors’ Guide <file:///C:/CodeFromBooks/julia-deeplearning-
+    book-main/julia-deeplearning-book-main/docs/contributors.html>
+  *
+    References <file:///C:/CodeFromBooks/julia-deeplearning-book-main/
+    julia-deeplearning-book-main/docs/references.html>
+
+
+    Table of contents
+
+  * 2.1 Computing Metrics Using Broadcasting <#computing-metrics-using-
+    broadcasting>
+  * 2.2 Calculating Gradients <#calculating-gradients>
+      o 2.2.1 Using |Flux.jl| <#using-flux.jl>
+  * 2.3 An End-to-End SGD Example <#an-end-to-end-sgd-example>
+  * 2.4 The MNIST Loss Function <#the-mnist-loss-function>
+  * 2.5 SGD and Mini-Batches <#sgd-and-mini-batches>
+  * 2.6 Creating an Optimizer <#creating-an-optimizer>
+  * 2.7 Adding a Nonlinearity <#adding-a-nonlinearity>
+  * 2.8 Training a Digit Classifier <#training-a-digit-classifier>
+
+//
+
+Edit this page <https://github.com/pat-alt/julia-deeplearning-book/edit/
+main/chapters/c4.qmd>
+
+Report an issue <https://github.com/pat-alt/julia-deeplearning-book/
+issues/new>
+
+
+  2  Chapter 4: Under the Hood: Training a Digit Classifier
+
+Download MNIST dataset, and sepearate into training, validation and test
+sets:
+
+| <#cb1-1>threes = sort(readdir(joinpath(data_path, "train", "3")))
+ <#cb1-2>sevens = sort(readdir(joinpath(data_path, "train", "7")))
+ <#cb1-3>
+ <#cb1-4>threes
+
+|
+//
+
+|6131-element Vector{String}:
+ "10001.png"
+ "10012.png"
+ "10032.png"
+ "10035.png"
+ "10043.png"
+ "10053.png"
+ "10075.png"
+ "1008.png"
+ "10092.png"
+ "10094.png"
+ "10098.png"
+ "10100.png"
+ "10117.png"
+ ⋮
+ "9905.png"
+ "9914.png"
+ "9916.png"
+ "9917.png"
+ "993.png"
+ "9933.png"
+ "9954.png"
+ "9960.png"
+ "9975.png"
+ "9978.png"
+ "999.png"
+ "9992.png"
+
+|
+
+| <#cb3-1>im3_path = joinpath(data_path, "train", "3", threes[1])
+ <#cb3-2>im3 = load(joinpath(im3_path))
+
+|
+//
+
+| <#cb4-1>im3_array = convert(Array{Int}, im3 * 255)
+ <#cb4-2>im3_array[4:10, 4:10]
+
+|
+//
+
+|7×7 Matrix{Int64}:
+ 0  0    0    0    0    0    0
+ 0  0    0    0    0    0    0
+ 0  0    0    0    0    0   29
+ 0  0    0    0   48  166  224
+ 0  0   93  244  249  253  187
+ 0  0  107  253  253  230   48
+ 0  0    3   20   20   15    0
+
+|
+
+| <#cb6-1>seven_tensors = [load(joinpath(data_path, "train", "7", seven)) for seven in sevens]
+ <#cb6-2>three_tensors = [load(joinpath(data_path, "train", "3", three)) for three in threes]
+ <#cb6-3>size(seven_tensors), size(three_tensors)
+
+|
+//
+
+|((6265,), (6131,))
+
+|
+
+| <#cb8-1>three_tensors[1]
+ <#cb8-2>size(three_tensors[1])
+ <#cb8-3>size(three_tensors)
+
+|
+//
+
+|(6131,)
+
+|
+
+| <#cb10-1>stacked_sevens = MLUtils.stack(seven_tensors)
+ <#cb10-2>stacked_threes = MLUtils.stack(three_tensors)
+ <#cb10-3>size(stacked_sevens), size(stacked_threes)
+
+|
+//
+
+|((28, 28, 6265), (28, 28, 6131))
+
+|
+
+Alternatively one can create seven_tensors and three_tensors directly
+from MLUDatasets:
+
+| <#cb12-1>dataset = MLDatasets.MNIST(:train)
+ <#cb12-2>
+ <#cb12-3>stacked_sevens = dataset.features[:, :, dataset.targets.==7]
+ <#cb12-4>stacked_threes = dataset.features[:, :, dataset.targets.==3]
+ <#cb12-5>
+ <#cb12-6>size(stacked_sevens), size(stacked_threes)
+
+|
+//
+
+|((28, 28, 6265), (28, 28, 6131))
+
+|
+
+| <#cb14-1># length(size(stacked_threes))
+ <#cb14-2>ndims(stacked_threes)
+
+|
+//
+
+|3
+
+|
+
+| <#cb16-1>### need to transpose the dimensions
+ <#cb16-2>
+ <#cb16-3>stacked_sevens = permutedims(stacked_sevens, [2, 1, 3])
+ <#cb16-4>stacked_threes = permutedims(stacked_threes, [2, 1, 3])
+ <#cb16-5>
+ <#cb16-6>convert(Array{Gray}, hcat(stacked_sevens[:, :, 1], stacked_threes[:, :, 1]))
+
+|
+//
+
+| <#cb17-1>mean3 = mean(stacked_threes, dims=3)
+ <#cb17-2>mean3 = mean3[:, :, 1]
+ <#cb17-3>
+ <#cb17-4>convert(Array{Gray}, mean3)
+
+|
+//
+
+| <#cb18-1>mean7 = mean(stacked_sevens, dims=3)
+ <#cb18-2>mean7 = mean7[:, :, 1]
+ <#cb18-3>
+ <#cb18-4>convert(Array{Gray}, mean7)
+
+|
+//
+
+| <#cb19-1>a_3 = stacked_threes[:, :, 1]
+ <#cb19-2>dist_3_abs = mean(abs.(a_3 .- mean3))
+ <#cb19-3>dist_3_sqr = sqrt(mean((a_3 .- mean3) .^ 2))
+ <#cb19-4>dist_3_abs, dist_3_sqr
+
+|
+//
+
+|(0.12612005f0, 0.23508778f0)
+
+|
+
+| <#cb21-1>Flux.Losses.mae(a_3, mean3), sqrt(Flux.Losses.mse(a_3, mean3))
+
+|
+//
+
+|(0.12612005f0, 0.23508778f0)
+
+|
+
+
+    2.1 Computing Metrics Using Broadcasting<#computing-metrics-using-
+    broadcasting>
+
+The rule of broadcasting in Julia is different from Python? In Python,
+first align all dimensions to the right, then broadcast. In Julia, first
+align all dimensions to the left, then broadcast. So in python [1000,
+28, 28] - [28, 28] is allowed, but in Julia, we need [28, 28, 1000] -
+[28, 28]. Use |permutedims| to change the order of dimensions.
+
+| <#cb23-1>valid_threes = sort(readdir(joinpath(data_path, "test", "3")))
+ <#cb23-2>valid_3_tens = MLUtils.stack([load(joinpath(data_path, "test", "3", img)) for img in valid_threes])
+ <#cb23-3>
+ <#cb23-4>valid_sevens = sort(readdir(joinpath(data_path, "test", "7")))
+ <#cb23-5>valid_7_tens = MLUtils.stack([load(joinpath(data_path, "test", "7", img)) for img in valid_sevens])
+ <#cb23-6>
+ <#cb23-7># valid_3_tens = permutedims(valid_3_tens, [3, 1, 2])
+ <#cb23-8>
+ <#cb23-9>size(valid_3_tens), size(valid_7_tens)
+
+|
+//
+
+|((28, 28, 1010), (28, 28, 1028))
+
+|
+
+| <#cb25-1>function mnist_distance(a, b)
+ <#cb25-2>    mm = mean(Float32.(abs.(a .- b)), dims=(1, 2))
+ <#cb25-3>    return dropdims(mm, dims=(1, 2))
+ <#cb25-4>end
+ <#cb25-5>
+ <#cb25-6>mnist_distance(a_3, mean3)[1]
+
+|
+//
+
+|0.12612005f0
+
+|
+
+| <#cb27-1>valid_3_dist = mnist_distance(valid_3_tens, mean3)
+ <#cb27-2>(size(valid_3_dist), valid_3_dist)
+
+|
+//
+
+|((1010,), Float32[0.12803426, 0.16230617, 0.12421783, 0.14686641, 0.120200165, 0.118782386, 0.16995831, 0.12664512, 0.13367367, 0.11829293  …  0.12947088, 0.1525875, 0.1556588, 0.13255748, 0.13654083, 0.17447978, 0.12789737, 0.15078008, 0.12630658, 0.12596397])
+
+|
+
+| <#cb29-1>size(valid_3_tens .- mean3)
+
+|
+//
+
+|(28, 28, 1010)
+
+|
+
+| <#cb31-1>is_3(x) = mnist_distance(x, mean3) .< mnist_distance(x, mean7)
+
+|
+//
+
+|is_3 (generic function with 1 method)
+
+|
+
+| <#cb33-1>is_3(a_3)
+ <#cb33-2>is_3(valid_3_tens[:, :, 1:10])
+ <#cb33-3>
+ <#cb33-4>is_3(valid_7_tens[:, :, 1:10])
+
+|
+//
+
+|10-element BitVector:
+ 0
+ 0
+ 0
+ 0
+ 0
+ 0
+ 0
+ 0
+ 0
+ 0
+
+|
+
+| <#cb35-1>accuracy_3s = mean(is_3(valid_3_tens))
+ <#cb35-2>accuracy_7s = mean(1 .- is_3(valid_7_tens))
+ <#cb35-3>
+ <#cb35-4>accuracy_3s, accuracy_7s
+
+|
+//
+
+|(0.9168316831683169, 0.9854085603112841)
+
+|
+
+
+    2.2 Calculating Gradients<#calculating-gradients>
+
+
+      2.2.1 Using |Flux.jl| <https://fluxml.ai/Flux.jl/stable/models/basics/><#using-flux.jl>
+
+Taking gradients in |Flux.jl| is as simple as calling |gradient| on a function. For example, to take the gradient of |f(x) = x^2| at |x = 2|, we can do the following:
+
+| <#cb37-1>f(x) = x^2
+ <#cb37-2>df(x) = gradient(f, x)[1]
+ <#cb37-3>df(2)
+
+|
+//
+
+|4.0
+
+|
+
+Below we implement and visualise gradient descent from scratch in Julia.
+
+| <#cb39-1>xmax = 10
+ <#cb39-2>n = 100
+ <#cb39-3>plt = plot(
+ <#cb39-4>    range(-xmax, xmax, length=n), f;
+ <#cb39-5>    label="f(x)", lw=5, xlim=1.5 .* [-xmax, xmax],
+ <#cb39-6>    xlab="Parameter", ylab="Loss", legend=false
+ <#cb39-7>)
+ <#cb39-8>
+ <#cb39-9>nsteps = 10
+ <#cb39-10>lrs = [0.05, 0.3, 0.975, 1.025]
+ <#cb39-11>descend(x; lr=0.1) = x - lr * df(x)
+ <#cb39-12>x = [-0.75xmax]
+ <#cb39-13>x = repeat(x, length(lrs), 1)                             # repeat x for each learning rate
+ <#cb39-14>plts = [deepcopy(plt) for i in 1:length(lrs)]           # repeat plt for each learning rate
+ <#cb39-15>anim = @animate for j in 1:nsteps
+ <#cb39-16>    global x = hcat(x, zeros(size(x, 1)))                # add column of zeros to x
+ <#cb39-17>    for (i, lr) in enumerate(lrs)
+ <#cb39-18>        _plt = plot(plts[i], title="lr = $lr", ylims=(0, f(xmax)), legend=false)
+ <#cb39-19>        scatter!([x[i, j]], [f(x[i, j])]; label=nothing, ms=5, c=:red)    # plot current point
+ <#cb39-20>        x[i, j+1] = descend(x[i, j]; lr=lr)                               # descend
+ <#cb39-21>        Δx = x[i, j+1] - x[i, j]
+ <#cb39-22>        Δy = f(x[i, j+1]) - f(x[i, j])
+ <#cb39-23>        quiver!([x[i, j]], [f(x[i, j])], quiver=([Δx], [0]), c=:red)          # horizontal arrow
+ <#cb39-24>        quiver!([x[i, j+1]], [f(x[i, j])], quiver=([0], [Δy]), c=:red)        # vertical arrow
+ <#cb39-25>        plts[i] = _plt
+ <#cb39-26>    end
+ <#cb39-27>    plot(
+ <#cb39-28>        plts..., legend=false,
+ <#cb39-29>        plot_title="Step $j", margin=5mm,
+ <#cb39-30>        dpi=300,
+ <#cb39-31>    )
+ <#cb39-32>end
+ <#cb39-33>gif(anim, joinpath(www_path, "c4_gd.gif"), fps=0.5)
+
+|
+//
+
+Figure 2.1: Gradient descent for different learning rates
+
+<#fig-gd>
+
+
+    2.3 An End-to-End SGD Example<#an-end-to-end-sgd-example>
+
+| <#cb40-1>## is time a good variable name?
+ <#cb40-2>time = collect(range(start=0, stop=19))
+ <#cb40-3>
+ <#cb40-4>speed = @. $rand(20) + 0.75 * (time - 9.5)^2 + 1
+ <#cb40-5>
+ <#cb40-6>scatter(time, speed, legend=false, xlabel="time", ylabel="speed")
+
+|
+//
+
+| <#cb41-1>function f(t, params)
+ <#cb41-2>    a, b, c = params
+ <#cb41-3>    return @. a * (t - b)^2 + c
+ <#cb41-4>end
+ <#cb41-5>
+ <#cb41-6>function mse(preds, targets)
+ <#cb41-7>    return sum((preds .- targets) .^ 2) / length(preds)
+ <#cb41-8>end
+
+|
+//
+
+|mse (generic function with 1 method)
+
+|
+
+| <#cb43-1>function show_preds(preds)
+ <#cb43-2>    scatter(time, speed)
+ <#cb43-3>    scatter!(time, preds, color="red")
+ <#cb43-4>end
+
+|
+//
+
+|show_preds (generic function with 1 method)
+
+|
+
+| <#cb45-1>params = rand(3)
+ <#cb45-2>preds = f(time, params)
+ <#cb45-3>
+ <#cb45-4>show_preds(preds)
+
+|
+//
+
+| <#cb46-1>loss = mse(preds, speed)
+
+|
+//
+
+|8296.82143644548
+
+|
+
+| <#cb48-1>dloss(params) = gradient(params -> mse(f(time, params), speed), params)
+ <#cb48-2>
+ <#cb48-3>grad = dloss(params)[1]
+ <#cb48-4>
+ <#cb48-5>lr = 1e-5
+ <#cb48-6>params = params .- lr .* grad
+ <#cb48-7>
+ <#cb48-8>preds = f(time, params)
+ <#cb48-9>mse(preds, speed)
+ <#cb48-10>
+ <#cb48-11>show_preds(preds)
+
+|
+//
+
+| <#cb49-1>## params will be updated in place
+ <#cb49-2>function apply_step!(params; lr=1e-5, prn=true)
+ <#cb49-3>    grad = dloss(params)[1]
+ <#cb49-4>    params .-= lr * grad ## inplace update
+ <#cb49-5>    preds = f(time, params)
+ <#cb49-6>    loss = mse(preds, speed)
+ <#cb49-7>    if prn
+ <#cb49-8>        println(loss)
+ <#cb49-9>        println(grad)
+ <#cb49-10>        println(params)
+ <#cb49-11>    end
+ <#cb49-12>    return preds
+ <#cb49-13>end
+
+|
+//
+
+|apply_step! (generic function with 1 method)
+
+|
+
+| <#cb51-1>params = rand(3)
+ <#cb51-2>plts = []
+ <#cb51-3>
+ <#cb51-4>for i in range(1, 4)
+ <#cb51-5>    push!(plts, show_preds(apply_step!(params; lr=0.0001, prn=false)))
+ <#cb51-6>end
+ <#cb51-7>
+ <#cb51-8>plot(
+ <#cb51-9>    plts..., legend=false,
+ <#cb51-10>    plot_title="First four steps", margin=5mm,
+ <#cb51-11>    dpi=300,
+ <#cb51-12>)
+
+|
+//
+
+| <#cb52-1>params = rand(3)
+ <#cb52-2>preds = f(time, params)
+ <#cb52-3>
+ <#cb52-4>plts = []
+ <#cb52-5>push!(plts, show_preds(preds))
+ <#cb52-6>
+ <#cb52-7>lr = 0.0001  ## how to adjust learning rate? takes a lot of time to learn
+ <#cb52-8>for i in range(0, 60000)
+ <#cb52-9>    apply_step!(params, prn=false)
+ <#cb52-10>end
+ <#cb52-11>
+ <#cb52-12>preds = apply_step!(params, prn=true);
+ <#cb52-13>push!(plts, show_preds(preds))
+ <#cb52-14>
+ <#cb52-15>plot(
+ <#cb52-16>    plts..., legend=false,
+ <#cb52-17>    plot_title="After 60000 steps", margin=5mm,
+ <#cb52-18>    dpi=300,
+ <#cb52-19>)
+
+|
+//
+
+|10.90886132109632
+[-0.0735022149927751, -0.0003901579811111944, 4.383430999602089]
+[0.6672579211758306, 9.493901611682551, 6.352134871734056]
+
+|
+
+
+    2.4 The MNIST Loss Function<#the-mnist-loss-function>
+
+| <#cb54-1>train_x = cat(stacked_threes, stacked_sevens, dims=3) |> x -> reshape(x, 28 * 28, :) |> transpose;
+ <#cb54-2>train_y = vcat(repeat([1], size(stacked_threes)[3]), repeat([0], size(stacked_sevens)[3]));
+ <#cb54-3>
+ <#cb54-4>size(train_x), size(train_y)
+
+|
+//
+
+|((12396, 784), (12396,))
+
+|
+
+| <#cb56-1>dset = [(train_x[i, :], train_y[i]) for i in range(1, size(train_x)[1])]
+ <#cb56-2>x, y = dset[1]
+ <#cb56-3>size(dset), size(x), y
+
+|
+//
+
+|((12396,), (784,), 1)
+
+|
+
+| <#cb58-1>valid_x = cat(valid_3_tens, valid_7_tens, dims=3) |> x -> reshape(x, 28 * 28, :) |> transpose;
+ <#cb58-2>valid_y = vcat(repeat([1], size(valid_3_tens)[3]), repeat([0], size(valid_7_tens)[3]));
+ <#cb58-3>valid_dset = zip(eachrow(valid_x), valid_y);
+ <#cb58-4>
+ <#cb58-5>size(valid_x), size(valid_y), size(valid_dset)
+
+|
+//
+
+|((2038, 784), (2038,), (2038,))
+
+|
+
+| <#cb60-1>init_params(size; std=1.0) = randn(size) * std
+ <#cb60-2>
+ <#cb60-3>weights = init_params((28 * 28, 1))
+ <#cb60-4>
+ <#cb60-5>bias = init_params(1)
+ <#cb60-6>
+ <#cb60-7>size(weights), size(bias)
+
+|
+//
+
+|((784, 1), (1,))
+
+|
+
+| <#cb62-1>train_x = convert(Array{Float32}, train_x)
+ <#cb62-2>
+ <#cb62-3>train_x[1:1, :] * weights .+ bias
+
+|
+//
+
+|1×1 Matrix{Float64}:
+ -3.501327342352872
+
+|
+
+Pytorch tensor provides a tag to indicate if gradient is to be computed.
+This is not needed in Flux? To get gradient, just use gradient function
+in Flux
+
+| <#cb64-1>gradient(weights -> sum(train_x[1:1, :] * weights), weights)
+
+|
+//
+
+|([0.0; 0.0; … ; 0.0; 0.0;;],)
+
+|
+
+| <#cb66-1>linear1(xb) = xb * weights .+ bias
+ <#cb66-2>preds = linear1(train_x)
+
+|
+//
+
+|12396×1 Matrix{Float64}:
+  -3.501327342352871
+  -7.803989646297762
+   0.6762347534331052
+  -3.023752660788845
+  -9.516878292448476
+  -7.033978158406221
+  -4.121724962898755
+   7.818492504419868
+  -2.4782311140758995
+   3.779727107749914
+  -3.408244480726173
+  -7.060928958728613
+  -2.1788888600992573
+   ⋮
+   9.819611612539923
+   0.8538666355803137
+   2.3249911800591567
+  -3.8884379846078874
+  -4.1295855377706445
+  -0.14468002821284043
+   1.5411110361966878
+  -6.228736530914673
+  -2.1027676354594456
+ -11.00265384543037
+  -0.504937167730418
+   4.139620206286243
+
+|
+
+| <#cb68-1>corrects = (preds .> 0.0) .=== Bool.(train_y)
+ <#cb68-2>
+ <#cb68-3>mean(corrects)
+
+|
+//
+
+|0.6069699903194579
+
+|
+
+| <#cb70-1>weights[1] *= 1.0001
+ <#cb70-2>
+ <#cb70-3>preds = linear1(train_x)
+ <#cb70-4>mean((preds .> 0.0) .== Bool.(train_y))
+
+|
+//
+
+|0.6069699903194579
+
+|
+
+| <#cb72-1>trgts = [1, 0, 1]
+ <#cb72-2>prds = [0.9, 0.4, 0.2]
+ <#cb72-3>
+ <#cb72-4>mnist_loss(predictions, targets) = mean(t === 1 ? 1 - p : p for (p, t) in zip(predictions, targets))
+ <#cb72-5>
+ <#cb72-6>mnist_loss(prds, trgts), mnist_loss([0.9, 0.4, 0.8], trgts)
+
+|
+//
+
+|(0.43333333333333335, 0.2333333333333333)
+
+|
+
+| <#cb74-1>sigmoid(x) = 1 / (1 + exp(-x))
+ <#cb74-2>
+ <#cb74-3>print(sigmoid.(rand(10)))
+ <#cb74-4>
+ <#cb74-5>plot(range(-5, 5, length=100), sigmoid)
+
+|
+//
+
+|[0.6410273776045075, 0.6105076166250384, 0.5783704340117538, 0.6426148235103056, 0.6852254892841372, 0.5984580626393032, 0.6717542924899141, 0.517005739780998, 0.5656790579343766, 0.6485622582089181]
+
+|
+
+| <#cb76-1>function mnist_loss(predictions, targets)
+ <#cb76-2>    predictions = sigmoid.(predictions)
+ <#cb76-3>    return mean([t === 1 ? 1 - p : p for (p, t) in zip(predictions, targets)])
+ <#cb76-4>end
+
+|
+//
+
+|mnist_loss (generic function with 1 method)
+
+|
+
+
+    2.5 SGD and Mini-Batches<#sgd-and-mini-batches>
+
+| <#cb78-1>coll = range(1, 15)
+ <#cb78-2>
+ <#cb78-3>dl = DataLoader((coll), batchsize=5, shuffle=true)
+ <#cb78-4>
+ <#cb78-5>collect(dl)
+
+|
+//
+
+|3-element Vector{Vector{Int64}}:
+ [2, 4, 8, 1, 10]
+ [12, 14, 7, 15, 3]
+ [6, 9, 11, 5, 13]
+
+|
+
+| <#cb80-1>lowercase_alphabets = 'a':'z' ## [Char(i) for i in 97:122]
+ <#cb80-2>
+ <#cb80-3>ds = [ (i, v) for (i, v) in enumerate(lowercase_alphabets)]
+ <#cb80-4>
+ <#cb80-5>dl = DataLoader(ds, batchsize=5, shuffle=true)
+ <#cb80-6>collect(dl)
+
+|
+//
+
+|6-element Vector{Vector{Tuple{Int64, Char}}}:
+ [(13, 'm'), (24, 'x'), (2, 'b'), (4, 'd'), (26, 'z')]
+ [(20, 't'), (25, 'y'), (12, 'l'), (22, 'v'), (18, 'r')]
+ [(15, 'o'), (7, 'g'), (5, 'e'), (3, 'c'), (11, 'k')]
+ [(23, 'w'), (16, 'p'), (1, 'a'), (6, 'f'), (21, 'u')]
+ [(14, 'n'), (8, 'h'), (9, 'i'), (19, 's'), (10, 'j')]
+ [(17, 'q')]
+
+|
+
+Does dataloader work with files and directories?
+
+| <#cb82-1>weights = init_params((28*28,1))
+ <#cb82-2>bias = init_params(1)
+ <#cb82-3>size(weights), size(bias)
+
+|
+//
+
+|((784, 1), (1,))
+
+|
+
+| <#cb84-1>function reformat_dl(d1)
+ <#cb84-2>    xb = MLUtils.stack([x for (x, y) in d1], dims=1)
+ <#cb84-3>    yb = MLUtils.stack([[y] for (x, y) in d1], dims=1)
+ <#cb84-4>    return xb, yb
+ <#cb84-5>end
+ <#cb84-6>
+ <#cb84-7>dl = DataLoader(dset, batchsize=256, shuffle=true)
+ <#cb84-8>
+ <#cb84-9>d1 = first(dl)
+ <#cb84-10>length(d1)
+ <#cb84-11>
+ <#cb84-12>xb, yb = reformat_dl(d1)
+ <#cb84-13>
+ <#cb84-14>size(xb), size(yb)
+
+|
+//
+
+|((256, 784), (256, 1))
+
+|
+
+| <#cb86-1>valid_x = convert(Array{Float32}, valid_x)
+ <#cb86-2>
+ <#cb86-3>valid_dset = [(valid_x[i, :], valid_y[i]) for i in range(1, size(valid_x)[1])]
+ <#cb86-4>
+ <#cb86-5>valid_dl = DataLoader(valid_dset, batchsize=256, shuffle=true)
+
+|
+//
+
+|8-element DataLoader(::Vector{Tuple{Vector{Float32}, Int64}}, shuffle=true, batchsize=256)
+  with first element:
+  256-element Vector{Tuple{Vector{Float32}, Int64}}
+
+|
+
+| <#cb88-1>batch = train_x[1:4, :]
+ <#cb88-2>size(batch)
+ <#cb88-3>
+ <#cb88-4>preds = linear1(batch)
+ <#cb88-5>
+ <#cb88-6>loss = mnist_loss(preds, train_y[1:4])
+ <#cb88-7>
+ <#cb88-8>## redefine linear layer to include weights and bias as parameters
+ <#cb88-9>
+ <#cb88-10>linear1(xb, weights, bias) = xb * weights .+ bias
+ <#cb88-11>preds = linear1(batch, weights, bias)
+ <#cb88-12>
+ <#cb88-13>curr_gr = gradient(weights, bias) do weights, bias
+ <#cb88-14>    preds = linear1(batch, weights, bias)
+ <#cb88-15>    mnist_loss(preds, train_y[1:4])
+ <#cb88-16>end
+
+|
+//
+
+|([0.0; 0.0; … ; 0.0; 0.0;;], [-0.00019200529295718371])
+
+|
+
+| <#cb90-1># using dictionary to store parameters
+ <#cb90-2>
+ <#cb90-3>params = Dict("weights" => weights, "bias" => bias)
+ <#cb90-4>
+ <#cb90-5>linear1(xb, params) = xb * params["weights"] .+ params["bias"]
+ <#cb90-6>
+ <#cb90-7>curr_gr = gradient(params) do params
+ <#cb90-8>    preds = linear1(batch, params)
+ <#cb90-9>    mnist_loss(preds, train_y[1:4])
+ <#cb90-10>end
+
+|
+//
+
+|(Dict{Any, Any}("weights" => [0.0; 0.0; … ; 0.0; 0.0;;], "bias" => [-0.00019200529295718371]),)
+
+|
+
+| <#cb92-1>lr = 1e-4
+ <#cb92-2>function calc_grad(xb, yb, model, weights, bias)
+ <#cb92-3>    preds = model(xb, weights, bias)
+ <#cb92-4>    loss = mnist_loss(preds, yb)
+ <#cb92-5>    curr_gr = gradient(weights, bias) do weights, bias
+ <#cb92-6>        preds = model(xb, weights, bias)
+ <#cb92-7>        mnist_loss(preds, yb)
+ <#cb92-8>    end
+ <#cb92-9>end
+
+|
+//
+
+|calc_grad (generic function with 1 method)
+
+|
+
+Using params dictionary.
+
+| <#cb94-1>function calc_grad(xb, yb, model, params)
+ <#cb94-2>    preds = model(xb, params)
+ <#cb94-3>    loss = mnist_loss(preds, yb)
+ <#cb94-4>    curr_gr = gradient(params) do params
+ <#cb94-5>        preds = model(xb, params)
+ <#cb94-6>        mnist_loss(preds, yb)
+ <#cb94-7>    end
+ <#cb94-8>end
+
+|
+//
+
+|calc_grad (generic function with 2 methods)
+
+|
+
+| <#cb96-1>curr_grad = calc_grad(batch, train_y[1:4], linear1, weights, bias)
+ <#cb96-2>dict_grad = calc_grad(batch, train_y[1:4], linear1, params)[1]
+ <#cb96-3>## weights.grad.mean(),bias.grad
+ <#cb96-4>
+ <#cb96-5>mean(curr_grad[1]), mean(curr_grad[2])
+ <#cb96-6>mean(dict_grad["weights"]), mean(dict_grad["bias"])
+
+|
+//
+
+|(-3.7275223954992516e-5, -0.00019200529295718371)
+
+|
+
+| <#cb98-1>function train_epoch(model, lr, params)
+ <#cb98-2>    for dd in dl
+ <#cb98-3>        xb, yb = reformat_dl(dd)
+ <#cb98-4>        grad = calc_grad(xb, yb, model, params)[1]
+ <#cb98-5>        for k in keys(params)
+ <#cb98-6>            params[k] .-= grad[k] * lr
+ <#cb98-7>            ## no need to zero_grad? in Pytorch, p.grad.zero_()
+ <#cb98-8>        end
+ <#cb98-9>    end
+ <#cb98-10>end
+ <#cb98-11>
+ <#cb98-12>train_epoch(linear1, lr, params)
+
+|
+//
+
+| <#cb99-1>(preds .> 0.0) == Bool.(train_y[1:4])
+
+|
+//
+
+|false
+
+|
+
+| <#cb101-1>function batch_accuracy(xb, yb)
+ <#cb101-2>    preds = sigmoid.(xb)
+ <#cb101-3>    correct = (preds .> 0.5) .== yb
+ <#cb101-4>    return mean(correct)
+ <#cb101-5>end
+ <#cb101-6>
+ <#cb101-7>batch_accuracy(linear1(batch, params), train_y[1:4])
+
+|
+//
+
+|1.0
+
+|
+
+| <#cb103-1>function validate_epoch(model)
+ <#cb103-2>    accs = zeros(length(valid_dl))
+ <#cb103-3>    i = 1
+ <#cb103-4>    for dd in valid_dl
+ <#cb103-5>        xb, yb = reformat_dl(dd)
+ <#cb103-6>        accs[i] = batch_accuracy(model(xb, params), yb)
+ <#cb103-7>        i = i + 1
+ <#cb103-8>    end
+ <#cb103-9>    return round(mean(accs), digits=4)
+ <#cb103-10>end
+ <#cb103-11>
+ <#cb103-12>function train_accuracy(model)
+ <#cb103-13>    accs = zeros(length(dl))
+ <#cb103-14>    i = 1
+ <#cb103-15>    for dd in dl
+ <#cb103-16>        xb, yb = reformat_dl(dd)
+ <#cb103-17>        accs[i] = batch_accuracy(model(xb, params), yb)
+ <#cb103-18>        i = i + 1
+ <#cb103-19>    end
+ <#cb103-20>    return round(mean(accs), digits=4)
+ <#cb103-21>end
+
+|
+//
+
+|train_accuracy (generic function with 1 method)
+
+|
+
+| <#cb105-1>lr = 1
+ <#cb105-2>
+ <#cb105-3>weights = init_params((28 * 28, 1))
+ <#cb105-4>bias = init_params(1)
+ <#cb105-5>
+ <#cb105-6>params = Dict("weights" => weights, "bias" => bias)
+ <#cb105-7>
+ <#cb105-8>train_epoch(linear1, lr, params)
+ <#cb105-9>
+ <#cb105-10>validate_epoch(linear1)
+
+|
+//
+
+|0.9275
+
+|
+
+| <#cb107-1>for i in range(1, 20)
+ <#cb107-2>    train_epoch(linear1, lr, params)
+ <#cb107-3>    println((i, validate_epoch(linear1), train_accuracy(linear1)))
+ <#cb107-4>end
+
+|
+//
+
+|(1, 0.9499, 0.9512)
+(2, 0.9583, 0.9591)
+(3, 0.9612, 0.9639)
+(4, 0.9632, 0.9657)
+(5, 0.9638, 0.9678)
+(6, 0.9656, 0.9694)
+(7, 0.9656, 0.9705)
+(8, 0.9681, 0.9716)
+(9, 0.9686, 0.9722)
+(10, 0.9706, 0.9731)
+(11, 0.9711, 0.9737)
+(12, 0.973, 0.9745)
+(13, 0.9735, 0.9756)
+(14, 0.9735, 0.9762)
+(15, 0.974, 0.9771)
+(16, 0.9741, 0.9774)
+(17, 0.9744, 0.9776)
+(18, 0.9749, 0.9789)
+(19, 0.9749, 0.9787)
+(20, 0.9749, 0.9794)
+
+|
+
+
+    2.6 Creating an Optimizer<#creating-an-optimizer>
+
+A Flux based implementation
+
+| <#cb109-1>model = Chain(
+ <#cb109-2>    Dense(28 * 28 => 1),
+ <#cb109-3>    Flux.sigmoid  ## or σ
+ <#cb109-4>)
+ <#cb109-5>
+ <#cb109-6>optim = Flux.setup(Flux.Adam(1.0), model)
+ <#cb109-7>
+ <#cb109-8>losses = []
+ <#cb109-9>
+ <#cb109-10>for epoch in 1:20
+ <#cb109-11>    for dd in dl
+ <#cb109-12>        xb, yb = reformat_dl(dd)
+ <#cb109-13>        loss, grads = Flux.withgradient(model) do m
+ <#cb109-14>            # Evaluate model and loss inside gradient context:
+ <#cb109-15>            y_hat = m(xb')
+ <#cb109-16>            Flux.binarycrossentropy(y_hat, yb')  # mnist_loss(y_hat', yb)
+ <#cb109-17>        end
+ <#cb109-18>        Flux.update!(optim, model, grads[1])
+ <#cb109-19>        push!(losses, loss)  # logging, outside gradient context
+ <#cb109-20>    end
+ <#cb109-21>end
+ <#cb109-22>
+ <#cb109-23>optim # parameters, momenta and output have all changed
+ <#cb109-24>
+ <#cb109-25>xb, yb = reformat_dl(first(valid_dl))
+ <#cb109-26>
+ <#cb109-27>out2 = model(xb')  # first row is prob. of true, second row p(false)
+ <#cb109-28>
+ <#cb109-29>mean((out2[1, :] .> 0.5) .== yb)
+
+|
+//
+
+|0.9921875
+
+|
+
+Show examples of predicting seven and three.
+
+| <#cb111-1>xb, yb = reformat_dl(collect(valid_dl)[end])
+ <#cb111-2>
+ <#cb111-3>seven_examples = rand(findall(y -> y == 0, yb[:]), 9)
+ <#cb111-4>
+ <#cb111-5>convert(Array{Gray}, mosaic(map(i -> reshape(xb[i, :], 28, 28), seven_examples), ncol=3))
+ <#cb111-6>
+ <#cb111-7>[b > 0.5 ? "three" : "seven" for b in model(xb[seven_examples, :]')]
+
+|
+//
+
+|1×9 Matrix{String}:
+ "three"  "seven"  "seven"  "seven"  …  "seven"  "seven"  "seven"  "seven"
+
+|
+
+| <#cb113-1>three_examples = rand(findall(y -> y == 1, yb[:]), 9)
+ <#cb113-2>convert(Array{Gray}, mosaic(map(i -> reshape(xb[i, :], 28, 28), three_examples), ncol=3))
+ <#cb113-3>[b > 0.5 ? "three" : "seven" for b in model(xb[three_examples, :]')]
+
+|
+//
+
+|1×9 Matrix{String}:
+ "three"  "three"  "three"  "three"  …  "three"  "three"  "three"  "three"
+
+|
+
+
+    2.7 Adding a Nonlinearity<#adding-a-nonlinearity>
+
+| <#cb115-1>function simple_net1(xb)
+ <#cb115-2>    res = xb * w1 .+ b1'
+ <#cb115-3>    res[res.<0] .= 0
+ <#cb115-4>    res = res * w2 .+ b2
+ <#cb115-5>    return res
+ <#cb115-6>end
+ <#cb115-7>
+ <#cb115-8>w1 = init_params((28 * 28, 30))
+ <#cb115-9>b1 = init_params(30)
+ <#cb115-10>w2 = init_params((30, 1))
+ <#cb115-11>b2 = init_params(1)
+ <#cb115-12>
+ <#cb115-13>simple_net1(train_x[1:4, :])
+
+|
+//
+
+|4×1 Matrix{Float64}:
+ -126.8325425611682
+  -91.884731723257
+ -106.8205913364877
+ -138.07959754797585
+
+|
+
+| <#cb117-1>plot(range(-5, 5), Flux.relu)
+
+|
+//
+
+| <#cb118-1>simple_net_flux = Chain(
+ <#cb118-2>    Flux.Dense(28 * 28, 30),
+ <#cb118-3>    Flux.relu,
+ <#cb118-4>    Flux.Dense(30, 1)
+ <#cb118-5>)
+ <#cb118-6>
+ <#cb118-7>Flux.params(simple_net_flux[1])[1] .= w1'
+ <#cb118-8>Flux.params(simple_net_flux[1])[2] .= b1
+ <#cb118-9>
+ <#cb118-10>Flux.params(simple_net_flux[3])[1] .= w2'
+ <#cb118-11>Flux.params(simple_net_flux[3])[2] .= b2
+ <#cb118-12>
+ <#cb118-13>simple_net_flux(train_x[1:4, :]')
+
+|
+//
+
+|1×4 Matrix{Float32}:
+ -126.833  -91.8847  -106.821  -138.08
+
+|
+
+
+    2.8 Training a Digit Classifier<#training-a-digit-classifier>
+
+The MNIST dataset can be loaded in Julia as follows:
+
+| <#cb120-1># Data
+ <#cb120-2>X, y = MLDatasets.MNIST(:train)[:]
+ <#cb120-3>y_enc = Flux.onehotbatch(y, 0:9)
+ <#cb120-4>Xtest, ytest = MLDatasets.MNIST(:test)[:]
+ <#cb120-5>ytest_enc = onehotbatch(ytest, 0:9)
+ <#cb120-6>mosaic(map(i -> convert2image(MNIST, X[:, :, i]), rand(1:60000, 100)), ncol=10)
+
+|
+//
+
+We can preprocess the data as follows:
+
+| <#cb121-1>i_train, i_val = [], []
+ <#cb121-2>for (k, v) in group_indices(y)
+ <#cb121-3>    _i_train, _i_val = splitobs(v, at=0.7)
+ <#cb121-4>    push!(i_train, _i_train...)
+ <#cb121-5>    push!(i_val, _i_val...)
+ <#cb121-6>end
+ <#cb121-7>Xtrain, ytrain = X[:, :, i_train], y_enc[:, i_train]
+ <#cb121-8>Xval, yval = X[:, :, i_val], y_enc[:, i_val]
+
+|
+//
+
+|([0.0 0.0 … 0.0 0.0; 0.0 0.0 … 0.0 0.0; … ; 0.0 0.0 … 0.0 0.0; 0.0 0.0 … 0.0 0.0;;; 0.0 0.0 … 0.0 0.0; 0.0 0.0 … 0.0 0.0; … ; 0.0 0.0 … 0.0 0.0; 0.0 0.0 … 0.0 0.0;;; 0.0 0.0 … 0.0 0.0; 0.0 0.0 … 0.0 0.0; … ; 0.0 0.0 … 0.0 0.0; 0.0 0.0 … 0.0 0.0;;; … ;;; 0.0 0.0 … 0.0 0.0; 0.0 0.0 … 0.0 0.0; … ; 0.0 0.0 … 0.0 0.0; 0.0 0.0 … 0.0 0.0;;; 0.0 0.0 … 0.0 0.0; 0.0 0.0 … 0.0 0.0; … ; 0.0 0.0 … 0.0 0.0; 0.0 0.0 … 0.0 0.0;;; 0.0 0.0 … 0.0 0.0; 0.0 0.0 … 0.0 0.0; … ; 0.0 0.0 … 0.0 0.0; 0.0 0.0 … 0.0 0.0], Bool[0 0 … 0 0; 0 0 … 1 1; … ; 0 0 … 0 0; 0 0 … 0 0])
+
+|
+
+Next, we define a data loader:
+
+| <#cb123-1>batchsize = 128
+ <#cb123-2>train_set = DataLoader((Xtrain, ytrain), batchsize=batchsize, shuffle=true)
+ <#cb123-3>val_set = DataLoader((Xval, yval), batchsize=batchsize)
+
+|
+//
+
+|141-element DataLoader(::Tuple{Array{Float32, 3}, OneHotMatrix{UInt32, Vector{UInt32}}}, batchsize=128)
+  with first element:
+  (28×28×128 Array{Float32, 3}, 10×128 OneHotMatrix(::Vector{UInt32}) with eltype Bool,)
+
+|
+
+We can now define a model, based on how we preprocessed the data:
+
+| <#cb125-1>model = Chain(
+ <#cb125-2>    Flux.flatten,
+ <#cb125-3>    Dense(28^2, 32, relu),
+ <#cb125-4>    Dense(32, 10),
+ <#cb125-5>    softmax
+ <#cb125-6>)
+
+|
+//
+
+Chain(
+  Flux.flatten,
+  Dense(784 => 32, relu),               # 25_120 parameters
+  Dense(32 => 10),                      # 330 parameters
+  NNlib.softmax,
+)                   # Total: 4 arrays, 25_450 parameters, 99.664 KiB.
+
+Finally, what’s left to do is to define a loss function and an optimiser:
+
+| <#cb126-1>loss(y_hat, y) = Flux.Losses.crossentropy(y_hat, y)
+ <#cb126-2>opt_state = Flux.setup(Adam(), model)
+
+|
+//
+
+Before we start training, we define some helper functions:
+
+| <#cb127-1># Callbacks:
+ <#cb127-2>function accuracy(model, data::DataLoader)
+ <#cb127-3>    acc = 0
+ <#cb127-4>    for (x, y) in data
+ <#cb127-5>        acc += sum(onecold(model(x)) .== onecold(y)) / size(y, 2)
+ <#cb127-6>    end
+ <#cb127-7>    return acc / length(data)
+ <#cb127-8>end
+ <#cb127-9>
+ <#cb127-10>function avg_loss(model, data::DataLoader)
+ <#cb127-11>    _loss = 0
+ <#cb127-12>    for (x, y) in data
+ <#cb127-13>        _loss += loss(model(x), y)[1]
+ <#cb127-14>    end
+ <#cb127-15>    return _loss / length(data)
+ <#cb127-16>end
+
+|
+//
+
+As a very last step, we set up our training logs:
+
+| <#cb128-1># Final setup:
+ <#cb128-2>nepochs = 100
+ <#cb128-3>acc_train, acc_val = accuracy(model, train_set), accuracy(model, val_set)
+ <#cb128-4>loss_train, loss_val = avg_loss(model, train_set), avg_loss(model, val_set)
+ <#cb128-5>
+ <#cb128-6>log = DataFrame(
+ <#cb128-7>    epoch=0,
+ <#cb128-8>    acc_train=acc_train,
+ <#cb128-9>    acc_val=acc_val,
+ <#cb128-10>    loss_train=loss_train,
+ <#cb128-11>    loss_val=loss_val
+ <#cb128-12>)
+
+|
+//
+
+Below we finally train our model:
+
+| <#cb129-1># Training loop:
+ <#cb129-2>for epoch in 1:nepochs
+ <#cb129-3>
+ <#cb129-4>    for (i, data) in enumerate(train_set)
+ <#cb129-5>
+ <#cb129-6>        # Extract data:
+ <#cb129-7>        input, label = data
+ <#cb129-8>
+ <#cb129-9>        # Compute loss and gradient:
+ <#cb129-10>        val, grads = Flux.withgradient(model) do m
+ <#cb129-11>            result = m(input)
+ <#cb129-12>            loss(result, label)
+ <#cb129-13>        end
+ <#cb129-14>
+ <#cb129-15>        # Detect loss of Inf or NaN. Print a warning, and then skip update!
+ <#cb129-16>        if !isfinite(val)
+ <#cb129-17>            @warn "loss is $val on item $i" epoch
+ <#cb129-18>            continue
+ <#cb129-19>        end
+ <#cb129-20>
+ <#cb129-21>        Flux.update!(opt_state, model, grads[1])
+ <#cb129-22>
+ <#cb129-23>    end
+ <#cb129-24>
+ <#cb129-25>    # Monitor progress:
+ <#cb129-26>    acc_train, acc_val = accuracy(model, train_set), accuracy(model, val_set)
+ <#cb129-27>    loss_train, loss_val = avg_loss(model, train_set), avg_loss(model, val_set)
+ <#cb129-28>    results = Dict(
+ <#cb129-29>        :epoch => epoch,
+ <#cb129-30>        :acc_train => acc_train,
+ <#cb129-31>        :acc_val => acc_val,
+ <#cb129-32>        :loss_train => loss_train,
+ <#cb129-33>        :loss_val => loss_val
+ <#cb129-34>    )
+ <#cb129-35>    push!(log, results)
+ <#cb129-36>
+ <#cb129-37>    # Print progress:
+ <#cb129-38>    vals = Matrix(results_df[2:end,[:loss_train,:loss_val]])
+ <#cb129-39>    plt = UnicodePlots.lineplot(1:epoch, vals;
+ <#cb129-40>        name=["Train","Validation"], title="Loss in epoch $epoch", xlim=(1,nepochs))
+ <#cb129-41>    UnicodePlots.display(plt)
+ <#cb129-42>
+ <#cb129-43>end
+
+|
+//
+
+Figure 2.2 <#fig-mnist> shows the training and validation loss and
+accuracy over epochs. The model is overfitting, as the validation loss
+increases after bottoming out at around epoch 20.
+
+| <#cb130-1>output = DataFrame(log)
+ <#cb130-2>output = output[2:end, :]
+ <#cb130-3>
+ <#cb130-4>anim = @animate for epoch in 1:maximum(output.epoch)
+ <#cb130-5>    p_loss = plot(output[1:epoch, :epoch], Matrix(output[1:epoch, [:loss_train, :loss_val]]),
+ <#cb130-6>        label=["Train" "Validation"], title="Loss", legend=:topleft)
+ <#cb130-7>    p_acc = plot(output[1:epoch, :epoch], Matrix(output[1:epoch, [:acc_train, :acc_val]]),
+ <#cb130-8>        label=["Train" "Validation"], title="Accuracy", legend=:topleft)
+ <#cb130-9>    plot(p_loss, p_acc, layout=(1, 2), dpi=300, margin=5mm, size=(800, 400))
+ <#cb130-10>end
+ <#cb130-11>gif(anim, joinpath(www_path, "c4_mnist.gif"), fps=5)
+
+|
+//
+
+Figure 2.2: Training and validation loss and accuracy
+
+<#fig-mnist>
+
+/
+
+/ 1  Introduction <file:///C:/CodeFromBooks/julia-deeplearning-book-
+main/julia-deeplearning-book-main/docs/intro.html>
+3  Chapter 5: Image Classification
+/
+
+/ <file:///C:/CodeFromBooks/julia-deeplearning-book-main/julia-
+deeplearning-book-main/docs/chapters/c5.html>
+
+
+
+using Main.nTransformerBlocks
+using CUDA
+using Flux
+using Functors
+using Random
+using LinearAlgebra
+using Distributions
+using ProgressMeter
+
+
+using Random
+
+batch_size = 64 # how many independent sequences will we process in parallel?
+block_size = 256 # what is the maximum context length for predictions?
+max_iters = 50
+eval_interval = 20
+learning_rate = 3e-4
+eval_iters = 5
+n_embd = 384
+n_head = 6
+head_size = n_embd ÷ n_head
+n_layer = 6
+tdropout = 0.2
+
+Random.seed!(1234)
+
+struct GPTLanguageModel
+    token_embedding_table
+    position_embedding_table
+    blocks
+    layer_norm
+    lm_head
+end
+
+function GPTLanguageModel(vocab_size, block_size, n_embd)
+    GPTLanguageModel(
+        # each token directly reads off the logits for the next token from a lookup table
+        Embedding(vocab_size=>n_embd),
+        Embedding(block_size=>n_embd),
+        BlockList([TBlock(n_embd; num_heads=n_head, dropout=tdropout) for _ in 1:n_layer]),
+        LayerNorm(n_embd), # final layer norm
+        Dense(n_embd, vocab_size),
+    )
+end
+
+Functors.@functor GPTLanguageModel
+
+(m::GPTLanguageModel)(idx; mask=nothing) = m(idx, nothing; mask=mask)
+
+function (m::GPTLanguageModel)(idx, targets; mask=nothing)
+    T, B = size(idx)
+    tok_emb = m.token_embedding_table(idx) # (C,T,B)
+    pos_emb = m.position_embedding_table(1:T) # (C,T)
+    emb = tok_emb .+ pos_emb # (C,T,B)
+    x = m.blocks(emb; mask=mask) # (C,T,B)
+    x2 = m.layer_norm(x) # (C,T,B)
+    logits = m.lm_head(x2) # (vocab_size,T,B)
+    if isnothing(targets)
+        loss = nothing
+    else
+        C, B, T = size(logits)
+        logits_reshaped = reshape(logits, C, T*B)
+        targets_reshaped = reshape(targets, T*B)
+        targets_onehot = Flux.onehotbatch(targets_reshaped, 1:vocab_size)
+        loss = Flux.logitcrossentropy(logits_reshaped, targets_onehot)
+    end
+    (logits=logits, loss=loss)
+end
+
+# wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+text = read("data.txt", String)
+
+# here are all the unique characters that occur in this text
+chars = (sort ∘ collect ∘ Set)(text)
+vocab_size = length(chars)
+
+# create a mapping from characters to integers
+stoi = Dict([(ch,i) for (i,ch) in enumerate(chars)])
+itos = Dict([(i,ch) for (i,ch) in enumerate(chars)])
+
+# encoder: take a string, output a list of integers
+encode(s) = [stoi[c] for c in s]
+
+# decoder: take a list of integers, output a string
+decode(l) = join([itos[i] for i in cpu(l)], "")
+
+# Train and test splits
+data = encode(text)
+n = Int(round(0.9*length(data))) # first 90% will be train, rest val
+train_data = data[1:n]
+val_data = data[n:end]
+
+# data loading
+function getbatch(split)
+    # generate a small batch of data of inputs x and targets y
+    data = split == "train" ? train_data : val_data
+    ix = rand(1:(length(data) - block_size), batch_size)
+    x = reduce(hcat, [data[i:i+block_size-1] for i in ix])
+    y = reduce(hcat, [data[i+1:i+block_size] for i in ix])
+     x, y
+end
+
+function estimateloss(model, mask)
+    out = Dict()
+    testmode!(model)
+    for split in ["train", "val"]
+        losses = zeros(eval_iters)
+        for k in 1:eval_iters
+            X, Y = getbatch(split)
+            logits, loss = model(X,Y; mask=mask)
+            losses[k] = loss
+        end
+        out[split] = mean(losses)
+    end
+    trainmode!(model)
+    out
+end
+
+function printsample(model)
+    println("################### SAMPLE ###################")
+    println(gensample(model))
+    println("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+end
+
+function gensample(model)
+    idx = generate(model, ones(Int, 1, 1), 1000)
+    decode(idx)
+end
+
+function generate(model::GPTLanguageModel, context, max_new_tokens)
+    m = model
+    testmode!(m)
+    idx = context
+    # idx is (B, T) array of indices in the current context
+    for _ in 1:max_new_tokens
+        # crop idx to the last block_size tokens
+        idx_cond = @view idx[max(end-block_size+1,1):end, :]
+        # get the predictions
+        logits, _ = m(idx_cond)
+        # focus only on the last time step
+        logits = logits[:, :, 1] # becomes (B, C)
+        # apply softmax to get probabilities
+        probs = Flux.softmax(logits, dims=1) # (B, C)
+        # sample from the distribution
+        id_next = Distributions.Categorical(probs[:,end]) |> rand
+        # append sampled index to the running sequence
+        idx = vcat(idx, [id_next])
+        print(decode(id_next))
+    end
+    trainmode!(m)
+    idx
+end
+
+# initialize the model
+model = GPTLanguageModel(vocab_size, block_size, n_embd)
+
+# generate from the model
+printsample(model)
+
+# initialize the Flux optimizer
+optim = Flux.setup(Flux.AdamW(learning_rate), model)
+
+function train!(model)
+    trainmode!(model)
+    batch_mask = Float32.(tril(fill(-Inf, block_size, block_size), -1))
+    @showprogress for iter in 1:max_iters
+        xb, yb = getbatch("train")
+        # every once in a while evaluate the loss on train and val sets
+        if iter == 1 || iter % eval_interval == 0 || (iter == max_iters)
+            println("\nestimating loss...")
+            losses = estimateloss(model, batch_mask)
+            println("step $(iter): train loss $(round(losses["train"], digits=4)), val loss $(round(losses["val"], digits=4))")
+            printsample(model)
+        end
+        loss, grads = Flux.withgradient(model) do m
+            m(xb, yb; mask=batch_mask).loss
+        end
+        Flux.update!(optim, model, grads[1])
+    end
+    testmode!(model)
+end
+
+# train the model
+train!(model)
+
+# generate from the model
+printsample(model)
+
+
+
+using Unicode
+
+filepath = "datasets/project_gutenberg_shakespeare.txt"
+out_path = "datasets/shakespeare_plays.txt"
+
+# text = open(filepath) do file
+#     read(file, String)
+# end
+
+sections_to_skip = [
+    1:80,            # Introduction
+    80:2_855,        # THE SONNETS
+    2_858:2_933,     # ALL’S WELL THAT ENDS WELL - preamble
+    7_808:7_820,     # ALL’S WELL THAT ENDS WELL - epilogue
+    7_822:7_937,     # THE TRAGEDY OF ANTONY AND CLEOPATRA - preamble
+    14_463:14_549,   # AS YOU LIKE IT - preamble
+    18_901:18_962,   # THE COMEDY OF ERRORS - preamble
+    22_102:22_189,   # THE TRAGEDY OF CORIOLANUS - preamble
+    28_547:28_641,   # CYMBELINE - preamble
+    34_432:34_511,   # THE TRAGEDY OF HAMLET, PRINCE OF DENMARK - preamble
+    41_130:41_208,   # THE FIRST PART OF KING HENRY THE FOURTH - preamble
+    45_937:46_034,   # THE SECOND PART OF KING HENRY THE FOURTH - preamble
+    51_099:51_130,   # THE SECOND PART OF KING HENRY THE FOURTH - epilogue
+    51_133:51_290,   # THE LIFE OF KING HENRY THE FIFTH - preamble
+    56_079:56_189,   # THE FIRST PART OF HENRY THE SIXTH - preamble
+    60_709:60_820,   # THE SECOND PART OF KING HENRY THE SIXTH - preamble
+    65_891:65_991,   # THE THIRD PART OF KING HENRY THE SIXTH - preamble
+    71_013:71_156,   # KING HENRY THE EIGHTH - preamble
+    74_600:74_630,   # _The order of the coronation_ - list of actor instructions
+    76_127:76_160,   # KING HENRY THE EIGHTH - epilogue
+    76_152:76_232,   # THE LIFE AND DEATH OF KING JOHN - preamble
+    80_252:80_336,   # THE TRAGEDY OF JULIUS CAESAR - preamble
+    84_899:84_983,   # THE TRAGEDY OF KING LEAR - preamble
+    91_008:91_076,   # LOVE’S LABOUR’S LOST - preamble
+    96_016:96_110,   # THE TRAGEDY OF MACBETH - preamble
+    100_166:100_248, # MEASURE FOR MEASURE - preamble
+    105_050:105_129, # THE MERCHANT OF VENICE - preamble
+    109_221:109_306, # THE MERRY WIVES OF WINDSOR - preamble
+    114_044:114_126, # A MIDSUMMER NIGHT’S DREAM - preamble
+    117_529:117_636, # MUCH ADO ABOUT NOTHING - preamble
+    122_129:122_197, # THE TRAGEDY OF OTHELLO, THE MOOR OF VENICE - preamble
+    128_411:128_546, # PERICLES, PRINCE OF TYRE - preamble
+    132_563:132_648, # THE LIFE AND DEATH OF KING RICHARD THE SECOND - preamble
+    136_891:136_998, # KING RICHARD THE THIRD - preamble
+    143_366:143_485, # THE TRAGEDY OF ROMEO AND JULIET - preamble
+    148_633:148_817, # THE TAMING OF THE SHREW - preamble
+    153_501:153_573, # THE TEMPEST - preamble
+    157_337:157_428, # THE LIFE OF TIMON OF ATHENS - preamble
+    161_758:161_842, # THE TRAGEDY OF TITUS ANDRONICUS - preamble
+    165_883:166_043, # TROILUS AND CRESSIDA - preamble
+    172_087:172_160, # TWELFTH NIGHT; OR, WHAT YOU WILL - preamble
+    176_583:176_654, # THE TWO GENTLEMEN OF VERONA - preamble
+    180_834:181_023, # THE TWO NOBLE KINSMEN - preamble
+    186_313:186_339, # THE TWO NOBLE KINSMEN - epilogue
+    186_345:186_420, # THE WINTER’S TALE - preamble
+    191_356:191_742, # A LOVER’S COMPLAINT
+    191_743:192_324, # THE PASSIONATE PILGRIM
+    192_325:192_418, # THE PHOENIX AND THE TURTLE
+    192_419:194605,  # THE RAPE OF LUCRECE
+    194_606:196_040, # VENUS AND ADONIS
+    196_041:196_391, # license
+]
+
+lines_to_skip = Set{Int}()
+for section in sections_to_skip
+    push!(lines_to_skip, section...)
+end
+
+lines = String[]
+starting_words = [
+    "SCENE",
+    "ACT",
+    "EPILOGUE",
+    "FINIS",
+    #"Enter",
+    #"Re-enter",
+    #" " # usually incidates an action
+]
+#actor_instruction = r"^\s*\[.+\]\s*$"
+open(filepath) do file
+    for (line_number, line) in enumerate(eachline(file))
+        if !(line_number in lines_to_skip) &&
+           !any([startswith(line, word) for word in starting_words]) #&&
+           #isnothing(match(actor_instruction, line))
+            push!(lines, line)
+        end
+    end
+end
+text = join(lines, "\n")
+text = replace(text, r"\n\n+"=>"\n\n")
+text = replace(text, r"\d+"=>"") # there are very few numbers in the text
+#text = replace(text, actor_instruction=>"")
+text = replace(text, "\t"=>" ")
+text = replace(text, " & "=>" AND ")
+text = replace(text, r"&c.?"=>"etc.")
+text = replace(text, "'"=>"")
+## Remove unicode
+text = Unicode.normalize(text, stripmark=true)
+text = replace(text, "…"=>"")
+text = replace(text, "Æ"=>"Ae")
+text = replace(text, "æ"=>"ae")
+text = replace(text, "œ"=>"oe")
+
+open(out_path, "w") do file
+    write(file, text[2:end]) # remove first new line
+end
+
+characters = join(sort(collect(Set(text))))
+
+
+
+using ChainRulesCore: @thunk
+using Flux
+using LinearAlgebra
+using NNlib: gather, softmax, batched_mul
+using Random
+using StatsBase
+
+import ChainRulesCore: rrule, NoTangent
+import Flux: _big_show
+
+
+
+"""
+makeCausal_mask(x, dims=2)
+
+Return a boolean square matrix `m` of the same type as `x` and of side `size(x, dims)`.
+Its elements are set such that `m[i, j] == i ≤ j`.
+"""
+function makeCausal_mask(x::AbstractArray; dims::Int=2)
+    len = size(x, dims)
+    mask = triu(trues_like(x, (len, len)))
+    mask
+end
+
+trues_like(x::AbstractArray, sz=size(x)) = fill!(similar(x, Bool, sz), true)
+
+
+"""
+tail(A, n)
+
+Return the last `n` rows of a matrix.
+"""
+function tail(A::AbstractMatrix, n::Int)
+    n = min(n, size(A, 1))
+    A[(end - n + 1):end, :]
+end
+
+"""
+mul4d(A, B) -> C
+
+4D matrix multiplication. Result has `C[:,:,k,l] == A[:,:,k,l] * B[:,:,k,l]`
+"""
+function mul4d(A::AbstractArray{T, 4}, B::AbstractArray{T, 4}) where T
+    if (size(A, 2) != size(B, 1)) || (size(A, 3) != size(B, 3)) || (size(A, 4) != size(B, 4))
+        message = "A has dimensions $(size(A)) but B has dimensions $(size(B))"
+        throw(DimensionMismatch(message))
+    end
+    C = Array{T, 4}(undef, size(A, 1), size(B, 2), size(A, 3), size(A, 4))
+    for l in 1:size(A, 4)
+        for k in 1:size(A, 3)
+            C[:, :, k, l] = A[:, :, k, l] * B[:, :, k, l]
+        end
+    end
+    C
+end
+
+function rrule(::typeof(mul4d), A::AbstractArray{T, 4}, B::AbstractArray{T, 4}) where T
+    C = mul4d(A, B)
+    function mul4d_pullBack(C̄)
+        Ā = @thunk mul4d(C̄, PermutedDimsArray(B, (2, 1, 3, 4)))
+        B̄ = @thunk mul4d(PermutedDimsArray(A, (2, 1, 3, 4)), C̄)
+        return NoTangent(), Ā, B̄
+    end
+    return C, mul4d_pullBack
+end
+
+
+apply_mask(logits, mask::Nothing) = logits
+
+"""
+apply_mask(logits, mask)
+
+Keep the values of `logits` where `mask` is `true`,
+else return negative infinity or a corresponding `typemin`.
+"""
+function apply_mask(logits, mask)
+    neginf = typemin(eltype(logits))
+    ifelse.(mask, logits, neginf)
+end
+
+
+"""
+multi_head_scaled_dot_attention(nhead, query, key, value; mask=nothing)
+
+Apply `scaled_dot_attention` in parallel across `nhead` heads.
+Each array is shaped from `(dm, N, B)` to `(dh, N, nhead, B)` and scaled dot attention is applied
+independently along the batch dimensions of `nhead` and `B`.
+The result is then shaped back into an `(dm, N, B)` array.
+
+Returns the transformed input sequence and the attention scores.
+"""
+function multi_head_scaled_dot_attention(nhead::Int, Q::A3, K::A3, V::A3
+                                         ; kwargs...) where {T, A3 <: AbstractArray{T, 3}}
+qs = size(Q)
+ks = size(K)
+vs = size(V)
+dm = size(Q, 1)
+dh = div(dm, nhead)
+#size(Q) == (dh*nhead, N, B) => (dh, nhead, N, B) => (dh, N, nhead, B)
+Q = permutedims(reshape(Q, dh, nhead, qs[2], qs[3]), [1, 3, 2, 4]);
+K = permutedims(reshape(K, dh, nhead, ks[2], ks[3]), [1, 3, 2, 4]);
+V = permutedims(reshape(V, dh, nhead, vs[2], vs[3]), [1, 3, 2, 4]);
+A, scores = scaled_dot_attention(Q, K, V; kwargs...)
+#size(A) == (dh, N, nhead, B) => (dh, nhead, N, B) => (dm, N, B)
+#size(scores) == (N, N, nhead, B)
+A = permutedims(A, [1, 3, 2, 4])
+A = reshape(A, dm, size(A, 3), size(A, 4))
+A, scores
+end
+
+"""
+scaled_dot_attention(query, key, value; mask=nothing)
+Scaled dot attention as proposed in [Attention Is All You Need](https://arxiv.org/abs/1706.03762).
+Returns the transformed input sequence and the attention scores.
+If the inputs are matrices, the outputs are equivalent to:
+
+scores = softmax(transpose(key) * query))
+A = 1/sqrt(dh) * value * scores
+
+along with masking if the mask is not nothing.
+If the inputs are 3D or 4D arrays, the above equations holds for each `A[:, :, k, l]` with inputs indexed at X[:, :, k, l]
+        where X is the query, key or value.
+        """
+
+        function scaled_dot_attention(
+            query::A3, key::A3, value::A3
+            ; mask::Union{Nothing, M}=nothing
+            ) where {T, A3 <: AbstractArray{T, 3}, M <: AbstractArray{Bool}}
+        # Input is (dh, N, nhead)
+        dh = size(query, 1)
+        keyT = permutedims(key, (2, 1, 3)) # (dkv, dh, nhead)
+        atten = one(T)/convert(T, sqrt(dh)) .* batched_mul(keyT, query) # (dkv, dh, nhead)*(dh, dq, nhead) => (dkv, dq, nhead)
+        atten = apply_mask(atten, mask) # (dkv, dq, nhead)
+        scores = softmax(atten; dims=1) # (dkv, dq, nhead)
+        batched_mul(value, scores), scores  # (dh, dkv, nhead)*(dkv, dq, nhead) => (dh, dq, nhead)
+        end
+
+        function scaled_dot_attention(query::A4, key::A4, value::A4; kwargs...) where {T, A4 <: AbstractArray{T, 4}}
+            batch_size = size(query)[3:end]
+            Q, K, V = map(x -> reshape(x, size(x, 1), size(x, 2), :), (query, key, value))
+            A, scores = scaled_dot_attention(Q, K, V; kwargs...)
+            A = reshape(A, (size(A, 1), size(A, 2), batch_size...))
+            scores = reshape(scores, (size(scores, 1), size(scores, 2), batch_size...))
+            A, scores
+        end
+
+        function scaled_dot_attention(
+            query::A2, key::A2, value::A2
+            ; mask::Union{Nothing, M}=nothing
+            ) where {T, A2 <: AbstractMatrix{T}, M <: AbstractArray{Bool}}
+        ## Matrix version for a single head. Input is (dh, N)
+        dh = size(query, 1)
+        atten = one(T)/convert(T, sqrt(dh)) .* transpose(key) * query # (dkv, dh)*(dh, dq) => (dkv, dq)
+        atten = apply_mask(atten, mask) # (dkv, dq)
+        scores = softmax(atten; dims=1) # (dkv, dq)
+        value * scores, scores          # (dh, dkv)*(dkv, dq) => (dh, dq)
+        end
+
+
+
+
+
+        """
+        PositionEncoding(dim_embedding::Int, max_length::Int=1000)
+
+        A position encoding layer for a matrix of size `dim_embedding`. `max_len` is the maximum acceptable length of input.
+
+            For each a pair of rows `(2i, 2i+1)` and a position `k`, the encoding is calculated as:
+
+            W[2i, k] = sin(pos/(1e4^(2i/dim_embedding)))
+            W[2i + 1, k] = cos(pos/(1e4^(2i/dim_embedding)))
+
+            """
+            struct PositionEncoding{W <: AbstractArray}
+                weight::W
+            end
+
+            Flux.@layer PositionEncoding trainable=()
+
+            function PositionEncoding(dim_embedding::Int, max_length::Int=1000)
+                W = make_position_encoding(dim_embedding, max_length)
+                PositionEncoding(W)
+            end
+
+            function make_position_encoding(dim_embedding::Int, seq_length::Int, n::Int=10000)
+                encoding = Matrix{Float32}(undef, dim_embedding, seq_length)
+                for pos in 1:seq_length
+                    for row in 0:2:(dim_embedding - 1)
+                        denom = 1/(n^(row/dim_embedding))
+                        encoding[row + 1, pos] = sin(pos * denom)
+                        encoding[row + 2, pos] = cos(pos * denom)
+                    end
+                end
+                encoding
+            end
+
+            (pe::PositionEncoding)(x::AbstractArray{<:Integer}) = NNlib.gather(pe.weight, x) # assume array of indices
+            (pe::PositionEncoding)(x::AbstractArray{<:AbstractFloat}) = (pe::PositionEncoding)(size(x, 2)) # assume array of weights
+
+            function (pe::PositionEncoding)(seq_length::Int)
+                max_length = size(pe.weight, 2)
+                if seq_length > max_length
+                    error("sequence length of $seq_length exceeds maximum position encoding length of $max_length")
+                end
+                pe(1:seq_length)
+            end
+
+            function Base.show(io::IO, pe::PositionEncoding)
+                print(io, "PositionEncoding($(size(pe.weight, 1)))")
+            end
+
+
+
+            """
+            IndexTokenizer(vocab::Vector{T}, unksym::T) where T
+
+            Convert words/tokens to indices.
+
+            Usage:
+            ```
+            indexer = IndexTokenizer(["this","book","recommend","highly"], "[UNK]")
+            indexer(["i","highly","recommend","this","book","by","brandon","sanderson"])
+            # [1, 5, 4, 2, 3, 1, 1, 1]
+            ```
+            """
+            struct IndexTokenizer{T}
+                vocabulary::Vector{T}
+                lookup::Dict{T, Int} # doubles space requirements but speeds up processing
+                unksym::T
+                unkidx::Int
+                function IndexTokenizer(vocab::Vector{T}, unksym::T) where T
+                    if !(unksym ∈ vocab)
+                        pushfirst!(vocab, unksym)
+                        unkidx = 1
+                    else
+                        unkidx = findfirst(isequal(unksym), vocab)
+                    end
+                    lookup = Dict(x => idx for (idx, x) in enumerate(vocab))
+                        new{T}(vocab, lookup, unksym, unkidx)
+                    end
+                end
+
+                Base.length(tokenizer::IndexTokenizer) = length(tokenizer.vocabulary)
+
+                function Base.show(io::IO, tokenizer::IndexTokenizer)
+                    T = eltype(tokenizer.vocabulary)
+                    print(io, "IndexTokenizer{$(T)}(length(vocabulary)=$(length(tokenizer)), unksym=$(tokenizer.unksym))")
+                end
+
+                """
+                encode(tokenizer::IndexTokenizer, x)
+
+                Encode the tokens to indices.
+                If a vector of sequences, output is maximum_sequence_length × batch_size
+                """
+                function encode(tokenizer::IndexTokenizer{T}, x::T) where T
+                    get(tokenizer.lookup, x, tokenizer.unkidx)
+                end
+
+                function encode(tokenizer::IndexTokenizer{T}, seq::AbstractVector{T}) where T
+                    map(x->encode(tokenizer, x), seq)
+                end
+
+                function encode(tokenizer::IndexTokenizer{T}, batch::AbstractVector{Vector{T}}) where T
+                    lengths = map(length, batch)
+                    indices = fill(tokenizer.unkidx, maximum(lengths), length(batch))
+                    for (j, seq) ∈ enumerate(batch)
+                        for (i, x) ∈ enumerate(seq)
+                            @inbounds indices[i, j] = encode(tokenizer, x)
+                        end
+                    end
+                    indices
+                end
+
+                (tokenizer::IndexTokenizer)(x) = encode(tokenizer, x)
+
+                """
+                decode(tokenizer::IndexTokenizer, x)
+
+                Decode indices to tokens.
+                """
+                decode(tokenizer::IndexTokenizer{T}, x::Int) where T = 0 <= x <= length(tokenizer) ? tokenizer.vocabulary[x] : tokenizer.unksym
+
+                function decode(tokenizer::IndexTokenizer{T}, seq::Vector{Int}) where T
+                    map(x->decode(tokenizer, x), seq)
+                end
+
+                function decode(tokenizer::IndexTokenizer{T}, indices::AbstractMatrix{Int}) where T
+                    nrow, ncol = size(indices)
+                    tokens = Vector{Vector{T}}(undef, ncol)
+                    for col ∈ 1:ncol
+                        token = Vector{T}(undef, nrow)
+                        for row ∈ 1:nrow
+                            token[row] = decode(tokenizer, indices[row, col])
+                        end
+                        tokens[col] = token
+                    end
+                    tokens
+                end
+
+                struct TransformerBlock{
+                    MHA<:MultiHeadAttention,
+                    N1<:LayerNorm,
+                    D1<:Dense,
+                    D2<:Dense,
+                    N2<:LayerNorm,
+                    DO<:Dropout}
+                multihead_attention::MHA
+                norm_attention::N1
+                dense1::D1
+                dense2::D2
+                norm_feedforward::N2
+                dropout::DO
+                end
+
+                # make whole layer trainable
+                Flux.@layer TransformerBlock
+
+                """
+                TransformerBlock(
+                    nhead, dim_model, dim_hidden
+                    ; act=relu, mask=nothing, pdrop=0.1
+                    )
+
+                    Create a transfomer block based on "Attention is all you need" (https://arxiv.org/abs/1706.03762).
+                    It consists of a multi-head attention layer followed by two fully connected layers, along with
+                    layer norms and residual connections.
+
+                    `nhead` is the number of heads for the multi-head attention.
+                        `dim_model` is the model dimension also known as the embedding layer dimension.
+                        The input and output are both of size `dim_model`.
+                        `dim_hidden` is the size of the hidden layer between the two dense layers.
+                        """
+                        TransformerBlock(
+                            nhead::Int,
+                            dim_model::Int,
+                            dim_hidden::Int;
+                            act=relu,
+                            pdrop::Float64=0.1,
+                            ) = TransformerBlock(
+                                MultiHeadAttention(nhead, dim_model, dim_model),
+                                LayerNorm(dim_model),
+                                Dense(dim_model, dim_hidden, act),
+                                Dense(dim_hidden, dim_model),
+                                LayerNorm(dim_model),
+                                Dropout(pdrop),
+                                )
+
+                            function (t::TransformerBlock)(x::A; mask::M=nothing) where {
+                                A<:AbstractArray, M<:Union{Nothing, AbstractArray{Bool}}}
+                            h, scores = t.multihead_attention(x, x, x; mask=mask) # (dm, N, B)
+                            h = t.dropout(h)
+                            h = x + h
+                            h = t.norm_attention(h)            # (dm, N, B)
+                            hff = t.dense1(h)                  # (dh, N, B)
+                            hff = t.dense2(hff)                # (dm, N, B)
+                            hff = t.dropout(hff)
+                            h = h + hff
+                            h = t.norm_feedforward(h)          # (dm, N, B)
+                            h
+                            end
+
+                            ## Show
+
+                            function Base.show(io::IO, block::TransformerBlock)
+                                print(io, "TransformerBlock(")
+                                print(io, block.multihead_attention)
+                                print(io, ", ", block.norm_attention)
+                                print(io, ", ", block.dense1)
+                                print(io, ", ", block.dense2)
+                                print(io, ", ", block.norm_feedforward)
+                                print(io, ")")
+                            end
+
+
+
+                            """
+                            MeanLayer(x)
+
+                            Reduce to the mean along dims=1.
+
+                            Compare `Flux.GlobalMeanPool()`.
+                            """
+                            struct MeanLayer end
+
+                            function (m::MeanLayer)(x::AbstractArray)
+                                mean(x, dims = 1)
+                            end
+
+                            """
+                            FlattenLayer(x)
+
+                            Return a matrix of nlayers × nbatch.
+                            """
+                            struct FlattenLayer end
+
+                            function (f::FlattenLayer)(x::AbstractArray{T, 3}) where T
+                                reshape(x, :, size(x, 3)) # same as Flux.flatten
+                            end
+
+                            function (f::FlattenLayer)(x::AbstractArray{T, 2}) where T
+                                reshape(x, :, 1) # returns a column vector
+                            end
+
+
+
+                            struct TMultiHeadAttention{Q<:Dense, K<:Dense, V<:Dense, O<:Dense}
+                                nhead::Int
+                                denseQ::Q
+                                denseK::K
+                                denseV::V
+                                denseO::O
+                            end
+
+                            # tell Flux which parameters are trainable
+                            Flux.@layer :ignore TMultiHeadAttention trainable=(denseQ, denseK, denseV, denseO)
+
+                            """
+                            MultiHeadAttention(nhead, dim_in, [dim_head,] dim_out)
+
+                            Multi-head dot product attention Layer. `nhead` is the number of heads,
+                            `dim_in` is the input dimension size, `dim_head` is the size of each head,
+                            `dim_out` is the output size. If `dim_head` is not specified, it defaults to `dim_in ÷ nhead`.
+                            """
+                            function TMultiHeadAttention(
+                                nhead::Int, dim_in::Int, dim_head::Int, dim_out::Int
+                                )
+                                TMultiHeadAttention(
+                                    nhead,
+                                    Dense(dim_in, dim_head*nhead; bias=false),
+                                    Dense(dim_in, dim_head*nhead; bias=false),
+                                    Dense(dim_in, dim_head*nhead; bias=false),
+                                    Dense(dim_head*nhead, dim_out),
+                                    )
+                            end
+
+                            function TMultiHeadAttention(
+                                nhead::Int, dim_in::Int, dim_out::Int
+                                )
+                                if dim_in % nhead != 0
+                                    error("input dimension=$dim_in is not divisible by number of heads=$nhead")
+                                end
+                                MultiHeadAttention(nhead, dim_in, div(dim_in, nhead), dim_out)
+                            end
+
+                            function (mha::TMultiHeadAttention)(
+                                query::A3, key::A3, value::A3; kwargs...) where {T, A3 <: AbstractArray{T, 3}}
+                            # batch multiplication version. Input is dm × N × B
+                            #size(Q) == (dh*nhead, N, B)
+                            Q = mha.denseQ(query)
+                            K = mha.denseK(key)
+                            V = mha.denseV(value)
+                            A, scores = multi_head_scaled_dot_attention(mha.nhead, Q, K, V; kwargs...)
+                            mha.denseO(A), scores
+                            end
+
+                            function (mha::TMultiHeadAttention)(query::A2, key::A2, value::A2
+                                                               ; kwargs...) where {T, A2 <: AbstractMatrix{T}}
+                            # single sample. Make it a batch of 1
+                            query = reshape(query, size(query, 1), size(query, 2), 1)
+                            key = reshape(key, size(key, 1), size(key, 2), 1)
+                            value = reshape(value, size(value, 1), size(value, 2), 1)
+                            A, scores = mha(query, key, value; kwargs...)
+                            reshape(A, size(A, 1), size(A, 2)), reshape(scores, size(scores)[1:3]...)
+                            end
+
+                            ## Show
+
+                            function Base.show(io::IO, mha::TMultiHeadAttention)
+                                dh = div(size(mha.denseQ.weight)[1], mha.nhead)
+                                dm = size(mha.denseQ.weight)[2]
+                                dout = size(mha.denseO.weight)[1]
+                                print(io, "MultiHeadAttention(")
+                                print(io, "nhead=$(mha.nhead), ")
+                                print(io, "head_size=$(dh), ")
+                                print(io, "$(dm)=>$(dout)")
+                                print(io, ")")
+                            end
+
+                            function Flux._big_show(io::IO, mha::TMultiHeadAttention, indent::Int=0)
+                                inner_indent = indent + 2
+                                print(io, " "^indent, "MultiHeadAttention(\n")
+                                println(io, " "^inner_indent, "nhead=$(mha.nhead),")
+                                Flux._layer_show(io, mha.denseQ, inner_indent, "denseQ")
+                                Flux._layer_show(io, mha.denseK, inner_indent, "denseK")
+                                Flux._layer_show(io, mha.denseV, inner_indent, "denseV")
+                                Flux._layer_show(io, mha.denseO, inner_indent, "denseO")
+                                print(io, " "^indent, ")")
+                                if indent == 0
+                                    Flux._big_finale(io, mha)
+                                else
+                                    println(io, ",")
+                                end
+                            end
+
+
+
+                            struct TransformerClassifier{
+                                E<:Flux.Embedding,
+                                PE<:Union{Flux.Embedding, PositionEncoding},
+                                DO<:Dropout,
+                                TB<:Vector{<:TransformerBlock},
+                                A,
+                                f<:FlattenLayer,
+                                D<:Dense
+                                }
+                            embedding::E
+                            position_encoding::PE
+                            dropout::DO
+                            blocks::TB
+                            agg_layer::A
+                            flatten_layer::f
+                            head::D
+                            end
+
+                            Flux.@layer TransformerClassifier
+
+                            function (t::TransformerClassifier)(x::A; mask::M=nothing) where {
+                                A<:AbstractArray, M<:Union{Nothing, AbstractMatrix{Bool}}}
+                            x = t.embedding(x)              # (dm, N, B)
+                            N = size(x, 2)
+                            x = x .+ t.position_encoding(1:N) # (dm, N, B)
+                            x = t.dropout(x)                # (dm, N, B)
+                            for block in t.blocks
+                                x = block(x; mask=mask)     # (dm, N, B)
+                            end
+                            x = t.agg_layer(x)              # (1, N, B)
+                            x = t.flatten_layer(x)          # (N, B)
+                            x = t.head(x)                   # (n_labels, B)
+                            x
+                            end
+
+                            struct TransformerGenerator{
+                                E<:Flux.Embedding,
+                                PE<:Union{Flux.Embedding, PositionEncoding},
+                                DO<:Dropout,
+                                TB<:Vector{<:TransformerBlock},
+                                D<:Dense,
+                                M<:Union{Nothing, AbstractMatrix{Bool}},
+                                }
+                            embedding::E
+                            position_encoding::PE
+                            dropout::DO
+                            blocks::TB
+                            head::D
+                            mask::M # optional buffer
+                            end
+
+                            Flux.@layer :ignore TransformerGenerator trainable=(embedding, position_encoding, blocks, dropout, head)
+
+                            function (t::TransformerGenerator)(x::A; mask::M=t.mask) where {
+                                A<:AbstractArray, M<:Union{Nothing, AbstractMatrix{Bool}}}
+                            x = t.embedding(x)              # (dm, N, B)
+                            N = size(x, 2)
+                            x = x .+ t.position_encoding(1:N) # (dm, N, B)
+                            x = t.dropout(x)                # (dm, N, B)
+                            for block in t.blocks
+                                x = block(x; mask=mask)     # (dm, N, B)
+                            end
+                            x = t.head(x)                   # (vocab_size, N, B)
+                            x
+                            end
+
+                            """
+                            generate([rng,] transformer, context; context_size, max_tokens=100)
+
+                            Generate batches of tokens starting from a given context.
+                            """
+                            function generate(
+                                rng::AbstractRNG, model::TransformerGenerator, context::AbstractMatrix{T}
+                                ; context_size::Int, max_tokens::Int=100,
+                                ) where T
+                            for i in 1:max_tokens
+                                context_crop = tail(context, context_size) # forget everything before the current context
+                                n = size(context_crop, 1)
+                                mask = isnothing(model.mask) ? nothing : view(model.mask, 1:n, 1:n)
+                                logits = model(context_crop; mask=mask) |> cpu # (vocab_size, n, B)
+                                # only focus on the last token
+                                # This means that some of the work done in the last block and in model.head is discarded
+                                logits = logits[:, end, :] # (vocab_size, B)
+                                context_next = multinomial_sampling(rng, logits)
+                                context = cat(context, transpose(context_next); dims=1)
+                            end
+                            context
+                            end
+
+                            function generate(model::TransformerGenerator, context::AbstractMatrix; kwargs...)
+                                generate(Random.default_rng(), model, context; kwargs...)
+                            end
+
+                            function multinomial_sampling(rng::AbstractRNG, logits::AbstractMatrix)
+                                probs = softmax(logits; dims=1)
+                                tokens = [sample(rng, Weights(p)) for p in eachcol(probs)]
+                                    tokens
+                                end
+
+                                ## Show
+                                function Base.show(io::IO, m::MIME"text/plain", t::TransformerGenerator)
+                                    _show_transformer_generator(io, t)
+                                end
+
+                                function _show_transformer_generator(io::IO, t::TransformerGenerator, indent::Int=0)
+                                    inner_indent = indent + 2
+                                    print(io, " "^indent, "TransformerGenerator(\n")
+                                    for layer in [t.embedding, t.position_encoding, t.dropout, t.blocks..., t.head]
+                                        if get(io, :typeinfo, nothing) === nothing  # e.g. top level in REPL
+                                            Flux._big_show(io, layer, inner_indent)
+                                            elseif !get(io, :compact, false)  # e.g. printed inside a Vector, but not a Matrix
+                                            Flux._layer_show(io, layer, inner_indent)
+
+                                            show(io, layer)
+                                        end
+                                    end
+                                    Flux._layer_show(io, t.mask, inner_indent, "mask")
+                                    print(io, " "^indent, ")")
+                                    if indent == 0
+                                        Flux._big_finale(io, t)
+                                    else
+                                        println(io, " "^indent, ",")
+                                    end
+                                end
+
+
+
+                         """
+    multi_head_scaled_dot_attention(nhead, query, key, value; mask=nothing)
+
+Apply `scaled_dot_attention` in parallel across `nhead` heads.
+Each array is shaped from `(dm, N, B)` to `(dh, N, nhead, B)` and scaled dot attention is applied
+independently along the batch dimensions of `nhead` and `B`.
+The result is then shaped back into an `(dm, N, B)` array.
+
+Returns the transformed input sequence and the attention scores.
+"""
+function multi_head_scaled_dot_attention(nhead::Int, Q::A3, K::A3, V::A3
+    ; kwargs...) where {T, A3 <: AbstractArray{T, 3}}
+    qs = size(Q)
+    ks = size(K)
+    vs = size(V)
+    dm = size(Q, 1)
+    dh = div(dm, nhead)
+    #size(Q) == (dh*nhead, N, B) => (dh, nhead, N, B) => (dh, N, nhead, B)
+    Q = permutedims(reshape(Q, dh, nhead, qs[2], qs[3]), [1, 3, 2, 4]);
+    K = permutedims(reshape(K, dh, nhead, ks[2], ks[3]), [1, 3, 2, 4]);
+    V = permutedims(reshape(V, dh, nhead, vs[2], vs[3]), [1, 3, 2, 4]);
+    A, scores = scaled_dot_attention(Q, K, V; kwargs...)
+    #size(A) == (dh, N, nhead, B) => (dh, nhead, N, B) => (dm, N, B)
+    #size(scores) == (N, N, nhead, B)
+    A = permutedims(A, [1, 3, 2, 4])
+    A = reshape(A, dm, size(A, 3), size(A, 4))
+    A, scores
+end
+
+"""
+    scaled_dot_attention(query, key, value; mask=nothing)
+
+Scaled dot attention as proposed in [Attention Is All You Need](https://arxiv.org/abs/1706.03762).
+Returns the transformed input sequence and the attention scores.
+
+If the inputs are matrices, the outputs are equivalent to:
+
+    scores = softmax(transpose(key) * query))
+    A = 1/sqrt(dh) * value * scores
+
+along with masking if the `mask` is not `nothing`.
+
+
+If the inputs are 3D or 4D arrays, the above equations holds for each `A[:, :, k, l]` with inputs indexed at `X[:, :, k, l]`
+where `X` is the `query`, `key` or `value`.
+"""
+function scaled_dot_attention(
+    query::A3, key::A3, value::A3
+    ; mask::Union{Nothing, M}=nothing
+    ) where {T, A3 <: AbstractArray{T, 3}, M <: AbstractArray{Bool}}
+    # Input is (dh, N, nhead)
+    dh = size(query, 1)
+    keyT = permutedims(key, (2, 1, 3)) # (dkv, dh, nhead)
+    atten = one(T)/convert(T, sqrt(dh)) .* batched_mul(keyT, query) # (dkv, dh, nhead)*(dh, dq, nhead) => (dkv, dq, nhead)
+    atten = apply_mask(atten, mask) # (dkv, dq, nhead)
+    scores = softmax(atten; dims=1) # (dkv, dq, nhead)
+    batched_mul(value, scores), scores  # (dh, dkv, nhead)*(dkv, dq, nhead) => (dh, dq, nhead)
+end
+
+function scaled_dot_attention(query::A4, key::A4, value::A4; kwargs...) where {T, A4 <: AbstractArray{T, 4}}
+    batch_size = size(query)[3:end]
+    Q, K, V = map(x -> reshape(x, size(x, 1), size(x, 2), :), (query, key, value))
+    A, scores = scaled_dot_attention(Q, K, V; kwargs...)
+    A = reshape(A, (size(A, 1), size(A, 2), batch_size...))
+    scores = reshape(scores, (size(scores, 1), size(scores, 2), batch_size...))
+    A, scores
+end
+
+function scaled_dot_attention(
+    query::A2, key::A2, value::A2
+    ; mask::Union{Nothing, M}=nothing
+    ) where {T, A2 <: AbstractMatrix{T}, M <: AbstractArray{Bool}}
+    ## Matrix version for a single head. Input is (dh, N)
+    dh = size(query, 1)
+    atten = one(T)/convert(T, sqrt(dh)) .* transpose(key) * query # (dkv, dh)*(dh, dq) => (dkv, dq)
+    atten = apply_mask(atten, mask) # (dkv, dq)
+    scores = softmax(atten; dims=1) # (dkv, dq)
+    value * scores, scores          # (dh, dkv)*(dkv, dq) => (dh, dq)
+end
+
+
+
+module Flux
+
+using Base: tail
+using Compat: @compat # for @compat public
+using Preferences
+using LinearAlgebra, Statistics, Random  # standard lib
+using MacroTools, Reexport, ProgressLogging, SpecialFunctions
+using MacroTools: @forward
+
+@reexport using NNlib
+using MLUtils
+const stack = MLUtils.stack  # now exported by Base
+import Optimisers: Optimisers, trainable, destructure  # before v0.13, Flux owned these functions
+using Optimisers: freeze!, thaw!, adjust!, trainables
+using Random: default_rng
+using Zygote, ChainRulesCore
+using Zygote: Params, @adjoint, gradient, pullback
+using Zygote.ForwardDiff: value
+export gradient
+
+@reexport using MLDataDevices: MLDataDevices, supported_gpu_backends, reset_gpu_device!,
+                    default_device_rng,
+                    gpu_device, cpu_device, xla_device,
+                    CPUDevice,
+                    CUDADevice, AMDGPUDevice, MetalDevice, oneAPIDevice,
+                    XLADevice,
+                    # get_device, # we define get_device here for retrocompatibility
+                    # gpu_backend!, # have to define here due to https://github.com/JuliaPackaging/Preferences.jl/issues/39
+                    get_device_type,
+                    DeviceIterator
+
+
+# Pirate error to catch a common mistake. (Internal function `base` because overloading `update!` is more likely to give ambiguities.)
+Optimisers.base(dx::Zygote.Grads) = error("Optimisers.jl cannot be used with Zygote.jl's implicit gradients, `Params` & `Grads`")
+
+export Chain, Dense, Embedding, EmbeddingBag,
+       Maxout, SkipConnection, Parallel, PairwiseFusion,
+       RNN, LSTM, GRU, GRUv3,
+       SamePad, Conv, CrossCor, ConvTranspose, DepthwiseConv,
+       AdaptiveMaxPool, AdaptiveMeanPool, GlobalMaxPool, GlobalMeanPool, MaxPool, MeanPool,
+       Dropout, AlphaDropout,
+       LayerNorm, BatchNorm, InstanceNorm, GroupNorm,
+       MultiHeadAttention,
+       Upsample, PixelShuffle,
+       fmap, cpu, gpu, f32, f64, f16, rand32, randn32, zeros32, ones32,
+       testmode!, trainmode!
+
+@compat(public, ( # mark unexported symbols as API, on Julia 1.11
+  # modules
+  Losses, Train,
+  # layers
+  Bilinear, Scale,
+  # utils
+  outputsize, state, create_bias, @layer,
+))
+
+include("optimise/Optimise.jl")
+using .Optimise
+export Descent, Adam, Momentum, Nesterov, RMSProp,
+  AdaGrad, AdaMax, AdaDelta, AMSGrad, NAdam, OAdam,
+  AdamW, RAdam, AdaBelief, InvDecay, ExpDecay,
+  WeightDecay, SignDecay, ClipValue, ClipNorm
+
+export ClipGrad, OptimiserChain  # these are const defined in deprecations, for ClipValue, Optimiser
+
+include("train.jl")
+using .Train
+using .Train: setup
+
+using Adapt, Functors, OneHotArrays
+include("utils.jl")
+include("functor.jl")
+
+@compat(public, (
+  # from OneHotArrays.jl
+  onehot, onehotbatch, onecold,
+  # from Functors.jl
+  functor, @functor, KeyPath, haskeypath, getkeypath,
+  # from Optimise/Train/Optimisers.jl
+  setup, update!, destructure, freeze!, adjust!, params, trainable, trainables
+))
+
+# Pirate error to catch a common mistake.
+Functors.functor(::Type{<:MLUtils.DataLoader}, x) = error("`DataLoader` does not support Functors.jl, thus functions like `Flux.gpu` will not act on its contents.")
+
+include("layers/show.jl")
+include("layers/macro.jl")
+
+include("layers/stateless.jl")
+include("layers/basic.jl")
+include("layers/conv.jl")
+include("layers/recurrent.jl")
+include("layers/normalise.jl")
+include("layers/upsample.jl")
+include("layers/attention.jl")
+
+include("loading.jl")
+
+include("outputsize.jl")
+export @autosize
+
+include("deprecations.jl")
+
+include("losses/Losses.jl")
+using .Losses
+
+include("devices.jl")
+export get_device, gpu_backend!
+
+# Distributed Training
+include("distributed/backend.jl")
+include("distributed/public_api.jl")
+export MPIBackend, NCCLBackend, DistributedUtils
+
+@compat(public, (
+  # init
+  glorot_uniform,
+  glorot_normal,
+  kaiming_uniform,
+  kaiming_normal,
+  truncated_normal,
+  lecun_normal,
+  orthogonal,
+  sparse_init,
+  identity_init,
+
+  # Losses
+  binary_focal_loss,
+  binarycrossentropy,
+  crossentropy,
+  dice_coeff_loss,
+  focal_loss,
+  hinge_loss,
+  huber_loss,
+  kldivergence,
+  label_smoothing,
+  logitbinarycrossentropy,
+  logitcrossentropy,
+  mae,
+  mse,
+  msle,
+  poisson_loss,
+  siamese_contrastive_loss,
+  squared_hinge_loss,
+  tversky_loss,
+))
+
+
+end # module
+
+
+## gpucompiler interface implementation
+
+Base.@kwdef struct CUDACompilerParams <: AbstractCompilerParams
+    cap::VersionNumber
+    ptx::VersionNumber
+end
+
+function Base.hash(params::CUDACompilerParams, h::UInt)
+    h = hash(params.cap, h)
+    h = hash(params.ptx, h)
+
+    return h
+end
+
+const CUDACompilerConfig = CompilerConfig{PTXCompilerTarget, CUDACompilerParams}
+const CUDACompilerJob = CompilerJob{PTXCompilerTarget,CUDACompilerParams}
+
+GPUCompiler.runtime_module(@nospecialize(job::CUDACompilerJob)) = CUDA
+
+# filter out functions from libdevice and cudadevrt
+GPUCompiler.isintrinsic(@nospecialize(job::CUDACompilerJob), fn::String) =
+    invoke(GPUCompiler.isintrinsic,
+           Tuple{CompilerJob{PTXCompilerTarget}, typeof(fn)},
+           job, fn) ||
+    fn == "__nvvm_reflect" || startswith(fn, "cuda")
+
+# link libdevice
+function GPUCompiler.link_libraries!(@nospecialize(job::CUDACompilerJob), mod::LLVM.Module,
+                                     undefined_fns::Vector{String})
+    # only link if there's undefined __nv_ functions
+    if !any(fn->startswith(fn, "__nv_"), undefined_fns)
+        return
+    end
+
+    lib = parse(LLVM.Module, read(libdevice))
+
+    # override libdevice's triple and datalayout to avoid warnings
+    triple!(lib, triple(mod))
+    datalayout!(lib, datalayout(mod))
+
+    GPUCompiler.link_library!(mod, lib) # note: destroys lib
+
+    @dispose pm=ModulePassManager() begin
+        push!(metadata(mod)["nvvm-reflect-ftz"],
+              MDNode([ConstantInt(Int32(1))]))
+        run!(pm, mod)
+    end
+
+    return
+end
+
+GPUCompiler.method_table(@nospecialize(job::CUDACompilerJob)) = method_table
+
+GPUCompiler.kernel_state_type(job::CUDACompilerJob) = KernelState
+
+function GPUCompiler.finish_module!(@nospecialize(job::CUDACompilerJob),
+                                    mod::LLVM.Module, entry::LLVM.Function)
+    entry = invoke(GPUCompiler.finish_module!,
+                   Tuple{CompilerJob{PTXCompilerTarget}, LLVM.Module, LLVM.Function},
+                   job, mod, entry)
+
+    # if this kernel uses our RNG, we should prime the shared state.
+    # XXX: these transformations should really happen at the Julia IR level...
+    if haskey(globals(mod), "global_random_keys")
+        f = initialize_rng_state
+        ft = typeof(f)
+        tt = Tuple{}
+
+        # don't recurse into `initialize_rng_state()` itself
+        if job.source.specTypes.parameters[1] == ft
+            return entry
+        end
+
+        # create a deferred compilation job for `initialize_rng_state()`
+        src = methodinstance(ft, tt, GPUCompiler.tls_world_age())
+        cfg = CompilerConfig(job.config; kernel=false, name=nothing)
+        job = CompilerJob(src, cfg, job.world)
+        id = length(GPUCompiler.deferred_codegen_jobs) + 1
+        GPUCompiler.deferred_codegen_jobs[id] = job
+
+        # generate IR for calls to `deferred_codegen` and the resulting function pointer
+        top_bb = first(blocks(entry))
+        bb = BasicBlock(top_bb, "initialize_rng")
+        @dispose builder=IRBuilder() begin
+            position!(builder, bb)
+            subprogram = LLVM.subprogram(entry)
+            if subprogram !== nothing
+                loc = DILocation(0, 0, subprogram)
+                debuglocation!(builder, loc)
+            end
+            debuglocation!(builder, first(instructions(top_bb)))
+
+            # call the `deferred_codegen` marker function
+            T_ptr = if LLVM.version() >= v"17"
+                LLVM.PointerType()
+            elseif VERSION >= v"1.12.0-DEV.225"
+                LLVM.PointerType(LLVM.Int8Type())
+            else
+                LLVM.Int64Type()
+            end
+            T_id = convert(LLVMType, Int)
+            deferred_codegen_ft = LLVM.FunctionType(T_ptr, [T_id])
+            deferred_codegen = if haskey(functions(mod), "deferred_codegen")
+                functions(mod)["deferred_codegen"]
+            else
+                LLVM.Function(mod, "deferred_codegen", deferred_codegen_ft)
+            end
+            fptr = call!(builder, deferred_codegen_ft, deferred_codegen, [ConstantInt(id)])
+
+            # call the `initialize_rng_state` function
+            rt = Core.Compiler.return_type(f, tt)
+            llvm_rt = convert(LLVMType, rt)
+            llvm_ft = LLVM.FunctionType(llvm_rt)
+            fptr = inttoptr!(builder, fptr, LLVM.PointerType(llvm_ft))
+            call!(builder, llvm_ft, fptr)
+            br!(builder, top_bb)
+        end
+
+        # XXX: put some of the above behind GPUCompiler abstractions
+        #      (e.g., a compile-time version of `deferred_codegen`)
+    end
+    return entry
+end
+
+function GPUCompiler.mcgen(@nospecialize(job::CUDACompilerJob), mod::LLVM.Module, format)
+    @assert format == LLVM.API.LLVMAssemblyFile
+    asm = invoke(GPUCompiler.mcgen,
+                 Tuple{CompilerJob{PTXCompilerTarget}, LLVM.Module, typeof(format)},
+                 job, mod, format)
+
+    # remove extraneous debug info on lower debug levels
+    if Base.JLOptions().debug_level < 2
+        # LLVM sets `.target debug` as soon as the debug emission kind isn't NoDebug. this
+        # is unwanted, as the flag makes `ptxas` behave as if `--device-debug` were set.
+        # ideally, we'd need something like LocTrackingOnly/EmitDebugInfo from D4234, but
+        # that got removed in favor of NoDebug in D18808, seemingly breaking the use case of
+        # only emitting `.loc` instructions...
+        #
+        # according to NVIDIA, "it is fine for PTX producers to produce debug info but not
+        # set `.target debug` and if `--device-debug` isn't passed, PTXAS will compile in
+        # release mode".
+        asm = replace(asm, r"(\.target .+), debug" => s"\1")
+    end
+
+    # if LLVM couldn't target the requested PTX ISA, bump it in the assembly.
+    if job.config.target.ptx != job.config.params.ptx
+        ptx = job.config.params.ptx
+        asm = replace(asm, r"(\.version .+)" => ".version $(ptx.major).$(ptx.minor)")
+    end
+
+    # no need to bump the `.target` directive; we can do that by passing `-arch` to `ptxas`
+
+    asm
+end
+
+
+## compiler implementation (cache, configure, compile, and link)
+
+# cache of compilation caches, per context
+const _compiler_caches = Dict{CuContext, Dict{Any, CuFunction}}();
+function compiler_cache(ctx::CuContext)
+    cache = get(_compiler_caches, ctx, nothing)
+    if cache === nothing
+        cache = Dict{Any, CuFunction}()
+        _compiler_caches[ctx] = cache
+    end
+    return cache
+end
+
+# cache of compiler configurations, per device (but additionally configurable via kwargs)
+const _compiler_configs = Dict{UInt, CUDACompilerConfig}()
+function compiler_config(dev; kwargs...)
+    h = hash(dev, hash(kwargs))
+    config = get(_compiler_configs, h, nothing)
+    if config === nothing
+        config = _compiler_config(dev; kwargs...)
+        _compiler_configs[h] = config
+    end
+    return config
+end
+@noinline function _compiler_config(dev; kernel=true, name=nothing, always_inline=false,
+                                         cap=nothing, ptx=nothing, kwargs...)
+    # determine the toolchain
+    llvm_support = llvm_compat()
+    cuda_support = cuda_compat()
+
+    # determine the PTX ISA to use. we want at least 6.2, but will use newer if possible.
+    requested_ptx = something(ptx, v"6.2")
+    llvm_ptxs = filter(>=(requested_ptx), llvm_support.ptx)
+    cuda_ptxs = filter(>=(requested_ptx), cuda_support.ptx)
+    if ptx !== nothing
+        # the user requested a specific PTX ISA
+        ## use the highest ISA supported by LLVM
+        isempty(llvm_ptxs) &&
+            error("Requested PTX ISA $ptx is not supported by LLVM $(LLVM.version())")
+        llvm_ptx = maximum(llvm_ptxs)
+        ## use the ISA as-is to invoke CUDA
+        cuda_ptx = ptx
+    else
+        # try to do the best thing (i.e., use the newest PTX ISA)
+        # XXX: is it safe to just use the latest PTX ISA? isn't it possible for, e.g.,
+        #      instructions to get deprecated?
+        isempty(llvm_ptxs) &&
+            error("CUDA.jl requires PTX $requested_ptx, which is not supported by LLVM $(LLVM.version())")
+        llvm_ptx = maximum(llvm_ptxs)
+        isempty(cuda_ptxs) &&
+            error("CUDA.jl requires PTX $requested_ptx, which is not supported by CUDA driver $(driver_version()) / runtime $(runtime_version())")
+        cuda_ptx = maximum(cuda_ptxs)
+    end
+
+    # determine the compute capabilities to use. this should match the capability of the
+    # current device, but if LLVM doesn't support it, we can target an older capability
+    # and pass a different `-arch` to `ptxas`.
+    ptx_support = ptx_compat(cuda_ptx)
+    requested_cap = @something(cap, min(capability(dev), maximum(ptx_support.cap)))
+    llvm_caps = filter(<=(requested_cap), llvm_support.cap)
+    if cap !== nothing
+        ## use the highest capability supported by LLVM
+        isempty(llvm_caps) &&
+            error("Requested compute capability $cap is not supported by LLVM $(LLVM.version())")
+        llvm_cap = maximum(llvm_caps)
+        ## use the capability as-is to invoke CUDA
+        cuda_cap = cap
+    else
+        ## use the highest capability supported by LLVM
+        isempty(llvm_caps) &&
+            error("Compute capability $(requested_cap) is not supported by LLVM $(LLVM.version())")
+        llvm_cap = maximum(llvm_caps)
+        ## use the highest capability supported by CUDA
+        cuda_caps = filter(<=(capability(dev)), cuda_support.cap)
+        isempty(cuda_caps) &&
+            error("Compute capability $(requested_cap) is not supported by CUDA driver $(driver_version()) / runtime $(runtime_version())")
+        cuda_cap = maximum(cuda_caps)
+    end
+
+    # NVIDIA bug #3600554: ptxas segfaults with our debug info, fixed in 11.7
+    debuginfo = runtime_version() >= v"11.7"
+
+    # create GPUCompiler objects
+    target = PTXCompilerTarget(; cap=llvm_cap, ptx=llvm_ptx, debuginfo, kwargs...)
+    params = CUDACompilerParams(; cap=cuda_cap, ptx=cuda_ptx)
+    CompilerConfig(target, params; kernel, name, always_inline)
+end
+
+# compile to executable machine code
+function compile(@nospecialize(job::CompilerJob))
+    # lower to PTX
+    # TODO: on 1.9, this actually creates a context. cache those.
+    asm, meta = JuliaContext() do ctx
+        GPUCompiler.compile(:asm, job)
+    end
+
+    # check if we'll need the device runtime
+    undefined_fs = filter(collect(functions(meta.ir))) do f
+        isdeclaration(f) && !LLVM.isintrinsic(f)
+    end
+    intrinsic_fns = ["vprintf", "malloc", "free", "__assertfail",
+                     "__nvvm_reflect" #= TODO: should have been optimized away =#]
+    needs_cudadevrt = !isempty(setdiff(LLVM.name.(undefined_fs), intrinsic_fns))
+
+    # prepare invocations of CUDA compiler tools
+    ptxas_opts = String[]
+    nvlink_opts = String[]
+    ## debug flags
+    if Base.JLOptions().debug_level == 1
+        push!(ptxas_opts, "--generate-line-info")
+    elseif Base.JLOptions().debug_level >= 2
+        push!(ptxas_opts, "--device-debug")
+        push!(nvlink_opts, "--debug")
+    end
+    ## relocatable device code
+    if needs_cudadevrt
+        push!(ptxas_opts, "--compile-only")
+    end
+
+    ptx = job.config.params.ptx
+    cap = job.config.params.cap
+    arch = "sm_$(cap.major)$(cap.minor)"
+
+    # validate use of parameter memory
+    argtypes = filter([KernelState, job.source.specTypes.parameters...]) do dt
+        !isghosttype(dt) && !Core.Compiler.isconstType(dt)
+    end
+    param_usage = sum(sizeof, argtypes)
+    param_limit = 4096
+    if cap >= v"7.0" && ptx >= v"8.1"
+        param_limit = 32764
+    end
+    if param_usage > param_limit
+        msg = """Kernel invocation uses too much parameter memory.
+                 $(Base.format_bytes(param_usage)) exceeds the $(Base.format_bytes(param_limit)) limit imposed by sm_$(cap.major)$(cap.minor) / PTX v$(ptx.major).$(ptx.minor)."""
+
+        try
+            details = "\n\nRelevant parameters:"
+
+            source_types = job.source.specTypes.parameters
+            source_argnames = Base.method_argnames(job.source.def)
+            while length(source_argnames) < length(source_types)
+                # this is probably due to a trailing vararg; repeat its name
+                push!(source_argnames, source_argnames[end])
+            end
+
+            for (i, typ) in enumerate(source_types)
+                if isghosttype(typ) || Core.Compiler.isconstType(typ)
+                    continue
+                end
+                name = source_argnames[i]
+                details *= "\n  [$(i-1)] $name::$typ uses $(Base.format_bytes(sizeof(typ)))"
+            end
+            details *= "\n"
+
+            if cap >= v"7.0" && ptx < v"8.1" && param_usage < 32764
+                details *= "\nNote: use a newer CUDA to support more parameters on your device.\n"
+            end
+
+            msg *= details
+        catch err
+            @error "Failed to analyze kernel parameter usage; please file an issue with a reproducer."
+        end
+        error(msg)
+    end
+
+    # compile to machine code
+    # NOTE: we use tempname since mktemp doesn't support suffixes, and mktempdir is slow
+    ptx_input = tempname(cleanup=false) * ".ptx"
+    ptxas_output = tempname(cleanup=false) * ".cubin"
+    write(ptx_input, asm)
+
+    # we could use the driver's embedded JIT compiler, but that has several disadvantages:
+    # 1. fixes and improvements are slower to arrive, by using `ptxas` we only need to
+    #    upgrade the toolkit to get a newer compiler;
+    # 2. version checking is simpler, we otherwise need to use NVML to query the driver
+    #    version, which is hard to correlate to PTX JIT improvements;
+    # 3. if we want to be able to use newer (minor upgrades) of the CUDA toolkit on an
+    #    older driver, we should use the newer compiler to ensure compatibility.
+    append!(ptxas_opts, [
+        "--verbose",
+        "--gpu-name", arch,
+        "--output-file", ptxas_output,
+        ptx_input
+    ])
+    proc, log = run_and_collect(`$(ptxas()) $ptxas_opts`)
+    log = strip(log)
+    if !success(proc)
+        reason = proc.termsignal > 0 ? "ptxas received signal $(proc.termsignal)" :
+                                       "ptxas exited with code $(proc.exitcode)"
+        msg = "Failed to compile PTX code ($reason)"
+        msg *= "\nInvocation arguments: $(join(ptxas_opts, ' '))"
+        if !isempty(log)
+            msg *= "\n" * log
+        end
+        msg *= "\nIf you think this is a bug, please file an issue and attach $(ptx_input)"
+        if parse(Bool, get(ENV, "BUILDKITE", "false"))
+            run(`buildkite-agent artifact upload $(ptx_input)`)
+        end
+        error(msg)
+    elseif !isempty(log)
+        @debug "PTX compiler log:\n" * log
+    end
+    rm(ptx_input)
+
+    # link device libraries, if necessary
+    #
+    # this requires relocatable device code, which prevents certain optimizations and
+    # hurts performance. as such, we only do so when absolutely necessary.
+    # TODO: try LTO, `--link-time-opt --nvvmpath /opt/cuda/nvvm`.
+    #       fails with `Ignoring -lto option because no LTO objects found`
+    if needs_cudadevrt
+        nvlink_output = tempname(cleanup=false) * ".cubin"
+        append!(nvlink_opts, [
+            "--verbose", "--extra-warnings",
+            "--arch", arch,
+            "--library-path", dirname(libcudadevrt),
+            "--library", "cudadevrt",
+            "--output-file", nvlink_output,
+            ptxas_output
+        ])
+        proc, log = run_and_collect(`$(nvlink()) $nvlink_opts`)
+        log = strip(log)
+        if !success(proc)
+            reason = proc.termsignal > 0 ? "nvlink received signal $(proc.termsignal)" :
+                                           "nvlink exited with code $(proc.exitcode)"
+            msg = "Failed to link PTX code ($reason)"
+            msg *= "\nInvocation arguments: $(join(nvlink_opts, ' '))"
+            if !isempty(log)
+                msg *= "\n" * log
+            end
+            msg *= "\nIf you think this is a bug, please file an issue and attach $(ptxas_output)"
+            error(msg)
+        elseif !isempty(log)
+            @debug "PTX linker info log:\n" * log
+        end
+        rm(ptxas_output)
+
+        image = read(nvlink_output)
+        rm(nvlink_output)
+    else
+        image = read(ptxas_output)
+        rm(ptxas_output)
+    end
+
+    return (image, entry=LLVM.name(meta.entry))
+end
+
+# link into an executable kernel
+function link(@nospecialize(job::CompilerJob), compiled)
+    # load as an executable kernel object
+    ctx = context()
+    mod = CuModule(compiled.image)
+    CuFunction(mod, compiled.entry)
+end
+
+
+## helpers
+
+# run a binary and collect all relevant output
+function run_and_collect(cmd)
+    stdout = Pipe()
+    proc = run(pipeline(ignorestatus(cmd); stdout, stderr=stdout), wait=false)
+    close(stdout.in)
+
+    reader = Threads.@spawn String(read(stdout))
+    Base.wait(proc)
+    log = strip(fetch(reader))
+
+    return proc, log
+end
+
+
+
+using Statistics
+using Flux
+using Flux.Losses
+import Optimisers
+using Zygote
+using ChainRulesCore
+
+using Transformers
+using Transformers.Layers
+using Transformers.TextEncoders
+using Transformers.Datasets
+using CUDA
+
+
+Base.@kwdef mutable struct Args
+    lr::Float64 = 1e-2	       # Learning rate
+    seqlen::Int = 50	       # Length of batch sequences
+    batchsz::Int = 50	       # Number of sequences in each batch
+    epochs::Int = 3            # Number of epochs
+    usegpu::Bool = true      # Whether or not to use the GPU
+    testpercent::Float64 = .05 # Percent of corpus examples to use for testing
+end
+
+enable_gpu(CUDA.functional()) # make `todevice` work on gpu if available
+
+function preprocess(data)
+    global textenc
+    x, t = data
+    input = encode(textenc, x, t)
+    return input
+end
+
+function smooth(et)
+    global Smooth
+    sm = fill!(similar(et, Float32), Smooth/length(textenc.vocab))
+    p = sm .* (1 .+ -et)
+    label = p .+ et .* (1 - convert(Float32, Smooth))
+    return label
+end
+ChainRulesCore.@non_differentiable smooth(et)
+
+function shift_decode_loss(logits, trg, trg_mask)
+    label = @view smooth(trg)[:, 2:end, :]
+    return logitcrossentropy(mean, @view(logits[:, 1:end-1, :]), label, trg_mask - 1)
+end
+
+
+
+function translate(x::AbstractString)
+    global textenc, embed, encoder, decoder, embed_decode, startsym, endsym
+    ix = encode(textenc, x).token
+    seq = [startsym]
+
+    encoder_input = (token = ix,)
+    src = embed(encoder_input)
+    enc = encoder(src).hidden_state
+
+    len = 500; # size(ix, 2)
+    for i = 1:len
+        decoder_input = (token = lookup(textenc, seq), memory = enc)
+        trg = embed(decoder_input)
+        dec = decoder(trg).hidden_state
+        logit = embed_decode(dec)
+        ntok = decode(textenc, argmax(@view(logit[:, end])))
+        push!(seq, ntok)
+        ntok == endsym && break
+    end
+    seq
+end
+
+
+
+
+
+# configuration
+const N = 2
+const V = 10
+const Smooth = 1e-6
+const Batch = 32
+const lr = 1e-4
+
+# text encoder / preprocess
+const startsym = "11"
+const endsym = "12"
+const unksym = "0"
+const labels = [unksym, startsym, endsym, map(string, 1:V)...]
+
+const textenc = TransformerTextEncoder(split, labels; startsym, endsym, unksym, padsym = unksym)
+
+function gen_dataPrev()
+    global V
+    d = join(rand(1:V, 10), ' ')
+    (d,d)
+end
+
+current_pos=1
+
+function gen_data(tpart::Vector{SubString{String}})
+  global current_pos
+  dataSize = size(tpart)[1]
+
+    current_pos+=1;
+    if (current_pos >= dataSize-11)
+        current_pos = 1
+    end
+    ((tpart[current_pos] * " "*  tpart[current_pos+1]*  " "*tpart[current_pos+2]* " "* tpart[current_pos+3]* " "* tpart[current_pos+4]*  " "*tpart[current_pos+5]* " "* tpart[current_pos+6] *" "* tpart[current_pos+7]  * " "*  tpart[current_pos+8]* " "*tpart[current_pos+9]* " "* tpart[current_pos+10]),
+    (tpart[current_pos+1] * " "*  tpart[current_pos+2]*  " "*tpart[current_pos+3]* " "* tpart[current_pos+4]* " "* tpart[current_pos+5]*  " "*tpart[current_pos+6]* " "* tpart[current_pos+7] *" "* tpart[current_pos+8] * " "*   tpart[current_pos+9]* " "* tpart[current_pos+10]* " "* tpart[current_pos+11]))
+
+end
+
+
+Base.@kwdef mutable struct Args
+    lr::Float64 = 1e-2	       # Learning rate
+    seqlen::Int = 50	       # Length of batch sequences
+    batchsz::Int = 50	       # Number of sequences in each batch
+    epochs::Int = 3            # Number of epochs
+    usegpu::Bool = true      # Whether or not to use the GPU
+    testpercent::Float64 = .05 # Percent of corpus examples to use for testing
+end
+
+
+
+
+
+
+function getdata(args::Args)
+    ## Download the data if not downloaded as 'input.txt'
+    isfile("input.txt") || download(
+        "https://cs.stanford.edu/people/karpathy/char-rnn/shakespeare_input.txt",
+"input.txt"
+        )
+
+    text = String(read("input.txt"))
+
+    ## an array of all unique characters
+    alphabet = [unique(text)..., '_']
+    stop = '_'
+
+    N = length(alphabet)
+    tpart = split(text)
+end
+
+
+args = Args(; )
+
+shakespeare_input = getdata(args)
+
+# model definition
+const hidden_dim = 512
+const head_num = 8
+const head_dim = 64
+const ffn_dim = 2048
+
+
+# define a Word embedding layer which turn word index to word vector
+word_embed = Embed(hidden_dim, length(textenc.vocab))
+
+# define a position embedding layer metioned above
+# since sin/cos position embedding does not have any parameter, `todevice` is not needed.
+pos_embed = SinCosPositionEmbed(hidden_dim)
+
+# define 2 layer of transformer
+encoder_trf = Transformer(TransformerBlock, N, head_num, hidden_dim, head_dim, ffn_dim)
+
+# define 2 layer of transformer decoder
+decoder_trf = Transformer(TransformerDecoderBlock, N, head_num, hidden_dim, head_dim, ffn_dim)
+
+# define the layer to get the final output probabilities
+# sharing weights with `word_embed`, don't/can't use `todevice`.
+#embed_decode = EmbedDecoder(word_embed)
+
+
+const token_embed = Embed(hidden_dim, length(textenc.vocab); scale = inv(sqrt(hidden_dim)))
+const embed = Layers.CompositeEmbedding(token = token_embed, pos = SinCosPositionEmbed(hidden_dim))
+const embed_decode = EmbedDecoder(token_embed)
+const encoder = Transformer(TransformerBlock       , N, head_num, hidden_dim, head_dim, ffn_dim)
+const decoder = Transformer(TransformerDecoderBlock, N, head_num, hidden_dim, head_dim, ffn_dim)
+
+const seq2seq = Seq2Seq(encoder, decoder)
+const trf_model = Layers.Chain(
+    Layers.Parallel{(:encoder_input, :decoder_input)}(
+        Layers.Chain(embed, Dropout(0.1))),
+    seq2seq,
+    Layers.Branch{(:logits,)}(embed_decode),
+    )
+trf_model = gpu(trf_model)
+
+    const opt_rule = Optimisers.Adam(lr)
+    const opt = Optimisers.setup(opt_rule, trf_model)
+
+
+
+function train!()
+        global Batch, trf_model
+        println("start training")
+        for i = 1:300
+         # data = batched([gen_data(shakespeare_input) for i = 1:Batch])
+            data = batched([getdata(args) for i=1:Batch])
+              input = preprocess(data)
+                decode_loss, (grad,) = Zygote.withgradient(trf_model) do model
+                    nt = model(input)
+                    shift_decode_loss(nt.logits, input.decoder_input.token, input.decoder_input.attention_mask)
+                end
+                i % 3 == 0 && @show decode_loss
+                Optimisers.update!(opt, trf_model, grad)
+            end
+        end
+
+
+
+function embedding(input)
+    we = word_embed(input.token)
+    pe = pos_embed(we)
+    return we .+ pe
+end
+
+
+function encoder_forward(input)
+    attention_mask = get(input, :attention_mask, nothing)
+    e = embedding(input)
+    t = encoder_trf(e, attention_mask) # return a NamedTuples (hidden_state = ..., ...)
+    return t.hidden_state
+end
+
+function decoder_forward(input, m)
+    attention_mask = get(input, :attention_mask, nothing)
+    cross_attention_mask = get(input, :cross_attention_mask, nothing)
+    e = embedding(input)
+    t = decoder_trf(e, m, attention_mask, cross_attention_mask) # return a NamedTuple (hidden_state = ..., ...)
+    p = embed_decode(t.hidden_state)
+    return p
+end
+
+function translate(x::AbstractString)
+    ix =  encode(textenc, x).token
+    seq = [startsym]
+
+    encoder_input = (token = ix,)
+    enc = encoder_forward(encoder_input)
+
+    len = size(ix, 2)
+    for i = 1:2len
+        decoder_input = (token = lookup(textenc, seq),)
+        logit = decoder_forward(decoder_input, enc)
+        ntok = decode(textenc, argmax(logit[:, end]))
+        push!(seq, ntok)
+        ntok == endsym && break
+    end
+    return seq
+end
+
+train!()
+
+
+translate("5 5 6 6 1 2 3 4 7 10")
+
+
+
+
+
+
+
+
+
